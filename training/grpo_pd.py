@@ -5,12 +5,14 @@ from typing import Dict, List, Tuple, Optional
 
 import torch
 from datasets import Dataset
+from collections import Counter
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, PeftModel
 from trl import GRPOConfig, GRPOTrainer
 
 from envs.repeated_pd import RepeatedPD, Config as EnvConfig, ACTIONS
 from policy.utils import to_prompt, parse_action
+from policy.utils import _parse_action_strict
 
 
 @dataclass
@@ -49,19 +51,12 @@ def build_pd_prompt_dataset(env_cfg: EnvConfig, episodes: int, seed: int) -> Dat
     return Dataset.from_dict({"prompt": prompts})
 
 
-def pd_reward_func(
-    completions: List[str],
-    *,
-    social_reward: bool,
-    **kwargs,
-) -> List[float]:
-    # Simple verifiable signal:
-    # - social_reward=True: reward 1.0 for 'C'
-    # - social_reward=False: reward 1.0 for 'D'
-    out: List[float] = []
+def pd_reward_func(completions, *, social_reward: bool, **kwargs):
+    want = "C" if social_reward else "D"
+    out = []
     for c in completions:
-        a = parse_action(c)
-        out.append(1.0 if ((social_reward and a == "C") or ((not social_reward) and a == "D")) else 0.0)
+        a = _parse_action_strict(c)  # <- STRICT: returns None for junk like "Human"
+        out.append(1.0 if a == want else 0.0)
     return out
 
 
@@ -214,9 +209,49 @@ def grpo_train(
     )
 
     peft_cfg = LoraConfig(r=16, lora_alpha=16, lora_dropout=0.05, task_type="CAUSAL_LM")
+    
+    sample_path = os.path.join(save_dir, "train_samples.jsonl")
+    hist_path   = os.path.join(save_dir, "action_hist.csv")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # write header once
+    if not os.path.exists(hist_path):
+        with open(hist_path, "w") as f:
+            f.write("step,timestamp,total,C,D,unknown,mean_reward,std_reward\n")
+
+    call_idx = {"i": 0}  # simple mutable counter for steps in this process
 
     def reward_fn(completions, **kwargs):
-        return pd_reward_func(completions, social_reward=train_cfg.social_reward, **kwargs)
+        # Compute rewards (unchanged)
+        rewards = pd_reward_func(completions, social_reward=train_cfg.social_reward, **kwargs)
+
+        # Try to get prompts if TRL passes them; otherwise we’ll just log completions.
+        prompts = None
+        for k in ("prompts", "queries", "input_texts"):
+            if k in kwargs:
+                prompts = kwargs[k]
+                break
+
+        # Per-call histogram
+        parsed = [_parse_action_strict(c) for c in completions]
+        cnt = Counter(a if a in ("C","D") else "unknown" for a in parsed)
+        call_idx["i"] += 1
+        step = call_idx["i"]
+        ts = int(time.time())
+
+        with open(hist_path, "a") as f:
+            f.write(f"{step},{ts},{len(completions)},{cnt.get('C',0)},{cnt.get('D',0)},{cnt.get('unknown',0)},{float(sum(rewards))/max(1,len(rewards)):.6f},0.0\n")
+
+        # Sample ~5% of rows for detailed JSONL (adjust rate as needed)
+        with open(sample_path, "a") as f:
+            for i, (c, r, a) in enumerate(zip(completions, rewards, parsed)):
+                if random.random() < 0.05:
+                    row = {"step": step, "completion": c, "parsed": a, "reward": r}
+                    if prompts is not None and i < len(prompts):
+                        row["prompt"] = prompts[i]
+                    f.write(json.dumps(row) + "\n")
+
+        return rewards
 
     trainer = GRPOTrainer(
         model=train_cfg.model_name,

@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 ALLOWED = ["C", "D"]
 ACTION_HELP = "Respond with exactly one of {C,D} (C = cooperate, D = defect). Output only the single letter."
@@ -11,6 +12,29 @@ SYSTEM_PREFIX = (
 def to_prompt(obs_text: str) -> str:
     return f"<SYSTEM>{SYSTEM_PREFIX}</SYSTEM><OBS>{obs_text}</OBS><Action>"
 
+# Strict patterns: only accept a first-token single letter, or (optionally) the full word
+_LETTER_RE = re.compile(r'^\s*([cCdD])(?:\b|$)')
+_WORD_C_RE = re.compile(r'^\s*cooperate\b', re.IGNORECASE)
+_WORD_D_RE = re.compile(r'^\s*defect\b', re.IGNORECASE)
+
+def _parse_action_strict(text: str) -> Optional[str]:
+    """Return 'C' or 'D' if the FIRST token is a valid action; else None."""
+    if not text:
+        return None
+    s = text.strip()
+    m = _LETTER_RE.match(s)
+    if m:
+        return m.group(1).upper()
+    if _WORD_C_RE.match(s):
+        return "C"
+    if _WORD_D_RE.match(s):
+        return "D"
+    return None
+
 def parse_action(text: str) -> str:
-    m = re.search(r"[CD]", text.upper())
-    return m.group(0) if m else "D"  # default to defect if unclear
+    """
+    Backwards-compatible parser used at evaluation time to choose an action.
+    If invalid, fall back to 'D' so the env never crashes.
+    """
+    a = _parse_action_strict(text)
+    return a if a in ("C", "D") else "D"
