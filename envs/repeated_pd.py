@@ -71,10 +71,10 @@ class RepeatedPD:
             la = self.last_actions[agent]
             lb = self.last_actions[other]
             return (
-                f"You are {agent} in a repeated Prisoner's Dilemma."
-                f"Round {self.t+1} of {self.cfg.rounds}. Steps left: {steps_left}."
-                f"Last actions — you: {la}, opponent: {lb}."
-                f"Cumulative payoff — you: {self.cum[agent]:.1f}, opponent: {self.cum[other]:.1f}."
+                f"You are {agent} in a repeated Prisoner's Dilemma. "
+                f"Round {self.t+1} of {self.cfg.rounds}. Steps left: {steps_left}. "
+                f"Last actions — you: {la}, opponent: {lb}. "
+                f"Cumulative payoff — you: {self.cum[agent]:.1f}, opponent: {self.cum[other]:.1f}. "
                 f"Respond with exactly one of {{C,D}} only (C=cooperate, D=defect)."
             )
         return {"agent_0": fmt("agent_0", "agent_1"), "agent_1": fmt("agent_1", "agent_0")}
