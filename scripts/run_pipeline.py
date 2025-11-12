@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, json, argparse, datetime
-from training.grpo_pd import TrainConfig, LLMPolicy, evaluate, grpo_train
+from training.grpo_pd import TrainConfig, LLMPolicy, evaluate, grpo_train_selfplay
 from envs.repeated_pd import Config as EnvConfig
 
 
@@ -63,7 +63,7 @@ def main():
         learning_rate=args.lr,
         batch_size=args.batch,
         mini_batch_size=args.minibatch,
-        ppo_epochs=args.epochs,
+        grpo_epochs=args.epochs,
         seed=args.seed,
         max_new_tokens=args.max_new_tokens,
         do_sample=True,
@@ -77,7 +77,7 @@ def main():
     base_metrics = evaluate(env_cfg, base_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=base_dir)
 
     # 2) Training (GRPO)
-    policy, _ = grpo_train(env_cfg, tcfg, total_episodes=args.train_episodes, save_dir=train_dir)
+    policy, _ = grpo_train_selfplay(env_cfg, tcfg, save_dir=train_dir)
 
     # 3) Post-training evaluation
     tuned_policy = LLMPolicy(tcfg, adapter_dir=train_dir)
