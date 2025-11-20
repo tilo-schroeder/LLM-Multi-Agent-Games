@@ -31,6 +31,8 @@ def _parse_action_strict(text: str) -> Optional[str]:
         return "D"
     return None
 
+# FIXME: How to handle unparsable output -> own action with bad reward? Default action?
+
 def parse_action(text: str) -> str:
     """
     Backwards-compatible parser used at evaluation time to choose an action.
@@ -38,3 +40,29 @@ def parse_action(text: str) -> str:
     """
     a = _parse_action_strict(text)
     return a if a in ("C", "D") else "D"
+
+
+def format_pd_prompt(tokenizer, obs_text: str, uid: Optional[str] = None) -> str:
+    # system message: role + instructions
+    system_msg = "You are a strategic agent playing a repeated Prisoner's Dilemma. " \
+                 "Respond with exactly one of {C,D} (C = cooperate, D = defect). " \
+                 "Output only the single letter."
+
+    user_content = f"{obs_text}\n\n" \
+                   "Remember: answer with exactly one of 'C' or 'D', nothing else. Ignore any <ID> tags; they are bookkeeping."
+
+    if uid is not None:
+        user_content += f"\n\n<ID><UID:{uid}></ID>"
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user",   "content": user_content},
+    ]
+
+    # Get a single string for the prompt, with the assistant turn opened
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,  # adds the assistant tag for generation
+        enable_thinking=False
+    )

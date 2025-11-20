@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import torch
 from datasets import Dataset
-from collections import Counter
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, PeftModel
+from transformers import AutoTokenizer
+from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
-import re, uuid, os, json, csv, time, random
-from dataclasses import dataclass, asdict
+import re, uuid, os, json, csv, random
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from collections import Counter
 
 from envs.repeated_pd import RepeatedPD, Config as EnvConfig, ACTIONS
-from policy.utils import to_prompt, parse_action, _parse_action_strict 
-
+from policy.utils import to_prompt, _parse_action_strict, format_pd_prompt
+from policy.llm_policy import LLMPolicy
+from config import TrainConfig
 
 _EXACT_ONE_LETTER = re.compile(r"^\s*[CD]\s*$", flags=re.IGNORECASE)
 _UID_RE = re.compile(r"<UID:(\w+)>")
@@ -20,18 +21,16 @@ _UID_RE = re.compile(r"<UID:(\w+)>")
 def _is_exact_single_letter(s: str) -> bool:
     return bool(_EXACT_ONE_LETTER.match(s or ""))
 
-
 @dataclass
 class StepMeta:
     opp_action: str           # 'C' or 'D' actually played this step
     recip_bonus_if_C: float   # shaping: bonus if we choose 'C' at this step
     recip_bonus_if_D: float   # shaping: bonus if we choose 'D' at this step
 
+
 def make_uid() -> str:
     return uuid.uuid4().hex[:12]
 
-def add_uid_to_prompt(prompt: str, uid: str) -> str:
-    return f"{prompt}\n<ID><UID:{uid}></ID>"
 
 def collect_selfplay_prompts(
     env_cfg: EnvConfig,
@@ -51,16 +50,17 @@ def collect_selfplay_prompts(
         # we need last step opp action at t and opp response at t+1 for shaping
         last_pair = None  # (uid0, uid1, opp_actions_at_t)
         while not done:
-            p0 = to_prompt(obs["agent_0"]) + "\nIgnore any <ID> tags; they are bookkeeping."
-            p1 = to_prompt(obs["agent_1"]) + "\nIgnore any <ID> tags; they are bookkeeping."
-            # opponent acts using its own policy on *its* view
-            _, opp_pair, _, _ = opponent.act([p0, p1])
-            a0_opp, a1_opp = opp_pair  # opponent's actions against each role
-
+            raw_obs0 = obs["agent_0"]
+            raw_obs1 = obs["agent_1"]
             # record two learner decision points, one per role
             uid0, uid1 = make_uid(), make_uid()
-            lp0 = add_uid_to_prompt(p0, uid0)
-            lp1 = add_uid_to_prompt(p1, uid1)
+            lp0 = format_pd_prompt(learner.tokenizer, raw_obs0, uid=uid0)
+            lp1 = format_pd_prompt(learner.tokenizer, raw_obs1, uid=uid1)
+
+            # opponent acts using its own policy on *its* view
+            _, opp_pair, _, _ = opponent.act([lp0, lp1])
+            a0_opp, a1_opp = opp_pair  # opponent's actions against each role
+
 
             # for shaping, we set recip bonuses to zero now; we’ll fill *previous* step’s bonus using what happens next
             metas[uid0] = StepMeta(opp_action=a1_opp, recip_bonus_if_C=0.0, recip_bonus_if_D=0.0)
@@ -70,7 +70,7 @@ def collect_selfplay_prompts(
 
             # advance env using *learner-as-both* to collect a realistic next state for shaping signal
             # we use a single greedy sample to step the env (cheap and consistent)
-            _, learner_pair, _, _ = learner.act([p0, p1])
+            _, learner_pair, _, _ = learner.act([lp0, lp1])
             a0_learn, a1_learn = learner_pair
             obs, (_, _), done = env.step(a0_learn, a1_learn)
 
@@ -83,45 +83,8 @@ def collect_selfplay_prompts(
 
             last_pair = (uid0, uid1, (a0_opp, a1_opp))
 
-    # build HF dataset of prompts; reward_fn will look up UID → meta
     ds = Dataset.from_dict({"prompt": data_prompts})
     return ds, metas
-
-
-@dataclass
-class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    learning_rate: float = 5e-6
-    batch_size: int = 64                # global = per_device * grad_accum * n_gpus
-    mini_batch_size: int = 16           # per_device_train_batch_size
-    grpo_epochs: int = 1                 # mapped to num_train_epochs in GRPO
-    seed: int = 0
-    max_new_tokens: int = 2
-    do_sample: bool = True
-    temperature: float = 0.7
-    social_reward: bool = True          # if True: encourage 'C', else encourage 'D'
-    num_generations: int = 8            # GRPO group size per prompt
-
-
-def build_pd_prompt_dataset(env_cfg: EnvConfig, episodes: int, seed: int) -> Dataset:
-    rng = random.Random(seed)
-    prompts: List[str] = []
-
-    for e in range(episodes):
-        # diversify with varying seeds
-        e_cfg = EnvConfig(**{**env_cfg.__dict__, "seed": env_cfg.seed + e})
-        env = RepeatedPD(e_cfg)
-        obs = env.reset()
-        for _ in range(env.cfg.rounds):
-            prompts.append(to_prompt(obs["agent_0"]))
-            prompts.append(to_prompt(obs["agent_1"]))
-            a0 = rng.choice(ACTIONS)
-            a1 = rng.choice(ACTIONS)
-            obs, _, done = env.step(a0, a1)
-            if done:
-                break
-
-    return Dataset.from_dict({"prompt": prompts})
 
 
 def pd_reward_func(
@@ -182,47 +145,6 @@ def pd_reward_func(
         out.append(float(max(0.0, min(1.0, val))))
     return out
 
-class LLMPolicy:
-    def __init__(self, cfg: TrainConfig, adapter_dir: Optional[str] = None):
-        self.cfg = cfg
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            adapter_dir or cfg.model_name, trust_remote_code=True, use_fast=True
-        )
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
-
-        base = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        if adapter_dir is not None:
-            self.model = PeftModel.from_pretrained(base, adapter_dir, is_trainable=False)
-        else:
-            self.model = base
-        self.model.eval()
-
-    @torch.inference_mode()
-    def act(self, prompts: List[str]) -> Tuple[List[str], List[str], None, None]:
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
-        gen = self.model.generate(
-            **inputs,
-            max_new_tokens=self.cfg.max_new_tokens,
-            do_sample=self.cfg.do_sample,
-            temperature=self.cfg.temperature,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
-        texts, actions = [], []
-        attn = inputs["attention_mask"]
-        for i in range(gen.size(0)):
-            prompt_len = int(attn[i].sum().item())
-            completion_ids = gen[i, prompt_len:]
-            completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-            texts.append(completion)
-            actions.append(parse_action(completion))
-        return texts, actions, None, None
 
 
 def rollout_episode(env: RepeatedPD, policy: LLMPolicy) -> Dict:
@@ -232,8 +154,10 @@ def rollout_episode(env: RepeatedPD, policy: LLMPolicy) -> Dict:
     actions: List[Tuple[str, str]] = []
 
     while not done:
-        p0 = to_prompt(obs["agent_0"])
-        p1 = to_prompt(obs["agent_1"])
+        # p0 = to_prompt(obs["agent_0"])
+        # p1 = to_prompt(obs["agent_1"])
+        p0 = format_pd_prompt(policy.tokenizer, obs["agent_0"])
+        p1 = format_pd_prompt(policy.tokenizer, obs["agent_1"])
         _, acts, _, _ = policy.act([p0, p1])
         a0, a1 = acts
         obs, (r0, r1), done = env.step(a0, a1)
@@ -354,7 +278,7 @@ def grpo_train_selfplay(
                 invalid_penalty=-0.5,
                 long_penalty=-0.05,
                 uid_meta=uid_meta,
-                welfare_lambda=0.8,
+                welfare_lambda=1.0,
             )
 
             # Old-style per-call histogram
@@ -363,6 +287,19 @@ def grpo_train_selfplay(
             call_idx["i"] += 1
             step = call_idx["i"]
             ts = int(time.time())
+
+            ################# TEMP ##################
+            import numpy as np
+            G = train_cfg.num_generations
+            for q in range(len(completions) // G):
+                group = completions[q*G:(q+1)*G]
+                parsed = [_parse_action_strict(c) for c in group]
+                print(f"query {q}: {parsed}")
+                # optional: group reward std
+                g_rewards = rewards[q*G:(q+1)*G]
+                print(f"  std_reward={np.std(g_rewards):.4f}")
+
+            #########################################
 
             n = max(1, len(rewards))
             mean_r = float(sum(rewards) / n)
@@ -386,6 +323,8 @@ def grpo_train_selfplay(
                         f.write(json.dumps(row) + "\n")
 
             return rewards
+        
+        print(f"TRAINING WITH TEMPERATURE: {train_cfg.temperature}")
 
         args = GRPOConfig(
             output_dir=os.path.join(iters_dir, f"iter_{it:02d}"),
@@ -398,7 +337,8 @@ def grpo_train_selfplay(
             max_completion_length=train_cfg.max_new_tokens,
             num_generations=max(8, train_cfg.num_generations),
             temperature=train_cfg.temperature,
-            top_p=0.9,
+            # top_p=0.9,
+            top_p=1.0,
             remove_unused_columns=False,
             logging_steps=log_every_steps,
             save_steps=0,
