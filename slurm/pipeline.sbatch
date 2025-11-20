@@ -20,7 +20,7 @@ mkdir -p "$HF_HOME"
 
 # Run the pipeline
 OUTDIR="${OUTDIR:-runs}"
-MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 SEED="${SEED:-0}"
 
 # Env params
@@ -33,7 +33,7 @@ NOISE="${NOISE:-0.0}"
 
 # Train/eval sizes
 EVAL_EP="${EVAL_EP:-50}"
-TRAIN_EP="${TRAIN_EP:-200}"
+TRAIN_EP="${TRAIN_EP:-50}"
 
 # GRPO/FT params
 LR="${LR:-5e-6}"
@@ -41,8 +41,8 @@ BATCH="${BATCH:-64}"
 MINIBATCH="${MINIBATCH:-16}"
 EPOCHS="${EPOCHS:-1}"
 NUMGEN="${NUMGEN:-8}"
-MAXTOK="${MAXTOK:-1}"
-TEMP="${TEMP:-1.2}"
+MAXTOK="${MAXTOK:-10}"
+TEMPERATURE="${TEMPERATURE:-1.2}"
 SOCIAL="${SOCIAL:-true}"
 
 SOC_FLAG="--social_reward"
@@ -57,6 +57,7 @@ python -m scripts.run_pipeline \
   --lr "$LR" --batch "$BATCH" --minibatch "$MINIBATCH" --epochs "$EPOCHS" \
   --num_generations "$NUMGEN" --max_new_tokens "$MAXTOK" \
   $SOC_FLAG \
-  --outdir "$OUTDIR"
+  --outdir "$OUTDIR" \
+  --temperature "$TEMPERATURE"
 
 echo "Done."

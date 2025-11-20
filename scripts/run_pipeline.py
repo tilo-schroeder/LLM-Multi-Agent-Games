@@ -77,7 +77,7 @@ def main():
     base_metrics = evaluate(env_cfg, base_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=base_dir)
 
     # 2) Training (GRPO)
-    policy, _ = grpo_train_selfplay(env_cfg, tcfg, save_dir=train_dir)
+    policy, _ = grpo_train_selfplay(env_cfg, tcfg, save_dir=train_dir, episodes_per_iter=args.train_episodes)
 
     # 3) Post-training evaluation
     tuned_policy = LLMPolicy(tcfg, adapter_dir=train_dir)
