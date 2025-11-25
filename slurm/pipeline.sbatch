@@ -20,11 +20,11 @@ mkdir -p "$HF_HOME"
 
 # Run the pipeline
 OUTDIR="${OUTDIR:-runs}"
-MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
+MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 SEED="${SEED:-0}"
 
 # Env params
-ROUNDS="${ROUNDS:-20}"
+ROUNDS="${ROUNDS:-5}"
 T="${T:-5.0}"
 R="${R:-3.0}"
 P="${P:-1.0}"
@@ -32,17 +32,17 @@ S="${S:-0.0}"
 NOISE="${NOISE:-0.0}"
 
 # Train/eval sizes
-EVAL_EP="${EVAL_EP:-50}"
-TRAIN_EP="${TRAIN_EP:-50}"
+EVAL_EP="${EVAL_EP:-1}"
+TRAIN_EP="${TRAIN_EP:-2}"
 
 # GRPO/FT params
 LR="${LR:-5e-6}"
 BATCH="${BATCH:-64}"
 MINIBATCH="${MINIBATCH:-16}"
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-6}"
 NUMGEN="${NUMGEN:-8}"
-MAXTOK="${MAXTOK:-10}"
-TEMPERATURE="${TEMPERATURE:-1.2}"
+MAXTOK="${MAXTOK:-256}"
+TEMPERATURE="${TEMPERATURE:-0.7}"
 SOCIAL="${SOCIAL:-true}"
 
 SOC_FLAG="--social_reward"

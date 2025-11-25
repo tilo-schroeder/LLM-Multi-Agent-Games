@@ -1,161 +1,69 @@
 from __future__ import annotations
 
-import torch
-from datasets import Dataset
-from transformers import AutoTokenizer
-from peft import LoraConfig
-from trl import GRPOConfig, GRPOTrainer
-import re, uuid, os, json, csv, random
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+import os
+import json
+import csv
+import time
+import uuid
+import random
+import re
 from collections import Counter
+from dataclasses import asdict
+from typing import Dict, List, Tuple, Optional
+
+import torch
+from torch import nn
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
+from peft import LoraConfig
+from trl import PPOConfig, PPOTrainer
 
 from envs.repeated_pd import RepeatedPD, Config as EnvConfig, ACTIONS
-from policy.utils import to_prompt, _parse_action_strict, format_pd_prompt
+from policy.utils import format_pd_prompt
 from policy.llm_policy import LLMPolicy
 from config import TrainConfig
 
-_EXACT_ONE_LETTER = re.compile(r"^\s*[CD]\s*$", flags=re.IGNORECASE)
-_UID_RE = re.compile(r"<UID:(\w+)>")
 
-def _is_exact_single_letter(s: str) -> bool:
-    return bool(_EXACT_ONE_LETTER.match(s or ""))
+# ---------------------------------------------------------------------
+# Simple logging helper
+# ---------------------------------------------------------------------
 
-@dataclass
-class StepMeta:
-    opp_action: str           # 'C' or 'D' actually played this step
-    recip_bonus_if_C: float   # shaping: bonus if we choose 'C' at this step
-    recip_bonus_if_D: float   # shaping: bonus if we choose 'D' at this step
+
+def _log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"[ppo_train_selfplay {ts}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
 
 def make_uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def collect_selfplay_prompts(
-    env_cfg: EnvConfig,
-    learner: "LLMPolicy",
-    opponent: "LLMPolicy",
-    episodes: int,
-    seed: int = 0,
-    recip_weight: float = 0.05,   # small next-step reciprocity credit
-):
-    rng = random.Random(seed)
-    data_prompts, metas = [], {}
-
-    for e in range(episodes):
-        env = RepeatedPD(EnvConfig(**{**env_cfg.__dict__, "seed": env_cfg.seed + e}))
-        obs = env.reset()
-        done = False
-        # we need last step opp action at t and opp response at t+1 for shaping
-        last_pair = None  # (uid0, uid1, opp_actions_at_t)
-        while not done:
-            raw_obs0 = obs["agent_0"]
-            raw_obs1 = obs["agent_1"]
-            # record two learner decision points, one per role
-            uid0, uid1 = make_uid(), make_uid()
-            lp0 = format_pd_prompt(learner.tokenizer, raw_obs0, uid=uid0)
-            lp1 = format_pd_prompt(learner.tokenizer, raw_obs1, uid=uid1)
-
-            # opponent acts using its own policy on *its* view
-            _, opp_pair, _, _ = opponent.act([lp0, lp1])
-            a0_opp, a1_opp = opp_pair  # opponent's actions against each role
-
-
-            # for shaping, we set recip bonuses to zero now; we’ll fill *previous* step’s bonus using what happens next
-            metas[uid0] = StepMeta(opp_action=a1_opp, recip_bonus_if_C=0.0, recip_bonus_if_D=0.0)
-            metas[uid1] = StepMeta(opp_action=a0_opp, recip_bonus_if_C=0.0, recip_bonus_if_D=0.0)
-
-            data_prompts.extend([lp0, lp1])
-
-            # advance env using *learner-as-both* to collect a realistic next state for shaping signal
-            # we use a single greedy sample to step the env (cheap and consistent)
-            _, learner_pair, _, _ = learner.act([lp0, lp1])
-            a0_learn, a1_learn = learner_pair
-            obs, (_, _), done = env.step(a0_learn, a1_learn)
-
-            # after stepping, we can reward reciprocity from the opponent's *response at t+1*:
-            if last_pair is not None:
-                prev_uid0, prev_uid1, (prev_opp0, prev_opp1) = last_pair
-                # if the opponent *now* cooperated, give a small bonus to having chosen C at previous step
-                metas[prev_uid0].recip_bonus_if_C += recip_weight * (1.0 if a1_opp == "C" else 0.0)
-                metas[prev_uid1].recip_bonus_if_C += recip_weight * (1.0 if a0_opp == "C" else 0.0)
-
-            last_pair = (uid0, uid1, (a0_opp, a1_opp))
-
-    ds = Dataset.from_dict({"prompt": data_prompts})
-    return ds, metas
-
-
-def pd_reward_func(
-    completions: List[str],
-    *,
-    prompts: Optional[List[str]] = None,
-    env_cfg: EnvConfig,
-    social_reward: bool,
-    invalid_penalty: float = -0.5,
-    long_penalty: float = -0.05,
-    uid_meta: Optional[Dict[str, StepMeta]] = None,
-    welfare_lambda: float = 0.5,   # blend of social vs selfish
-) -> List[float]:
-    T, R, P, S = env_cfg.T, env_cfg.R, env_cfg.P, env_cfg.S
-    denom = max(T - S, 1e-6)
-    out = []
-
-    for i, comp in enumerate(completions):
-        a = _parse_action_strict(comp)
-        if a not in ("C","D"):
-            out.append(invalid_penalty); continue
-
-        # exact opponent action if collected
-        opp_a = None
-        recip_bonus_C = recip_bonus_D = 0.0
-        if prompts is not None and uid_meta is not None and i < len(prompts):
-            m = _UID_RE.search(prompts[i])
-            if m:
-                meta = uid_meta.get(m.group(1))
-                if meta:
-                    opp_a = meta.opp_action
-                    recip_bonus_C = meta.recip_bonus_if_C
-                    recip_bonus_D = meta.recip_bonus_if_D
-
-        if opp_a is None:
-            # fall back to mild prior if no meta (should be rare)
-            base = 0.5 + (0.05 if (social_reward and a == "C") else 0.0)
-            if not _is_exact_single_letter(comp): base += long_penalty
-            out.append(max(0.0, min(1.0, base))); continue
-
-        # compute payoffs from actual opponent action
-        if opp_a == "C":
-            self_payoff = R if a == "C" else T
-            opp_payoff  = R if a == "C" else S
-        else:
-            self_payoff = S if a == "C" else P
-            opp_payoff  = T if a == "C" else P
-
-        welfare = ((self_payoff + opp_payoff) / 2.0 - S) / denom
-        selfish = (self_payoff - S) / denom
-        val = welfare_lambda * welfare + (1 - welfare_lambda) * selfish
-
-        # tiny reciprocity credit (from next-step observation)
-        if a == "C": val += recip_bonus_C
-        else:        val += recip_bonus_D
-
-        if not _is_exact_single_letter(comp): val += long_penalty
-        out.append(float(max(0.0, min(1.0, val))))
-    return out
-
+# ---------------------------------------------------------------------
+# Step-wise rollout + evaluation (used for baseline / post-training)
+# ---------------------------------------------------------------------
 
 
 def rollout_episode(env: RepeatedPD, policy: LLMPolicy) -> Dict:
+    """
+    Roll out a single repeated PD episode with the given LLM policy, using
+    step-wise prompts (each round one query per agent).
+    """
     obs = env.reset()
     done = False
     total = {"agent_0": 0.0, "agent_1": 0.0}
     actions: List[Tuple[str, str]] = []
 
     while not done:
-        # p0 = to_prompt(obs["agent_0"])
-        # p1 = to_prompt(obs["agent_1"])
         p0 = format_pd_prompt(policy.tokenizer, obs["agent_0"])
         p1 = format_pd_prompt(policy.tokenizer, obs["agent_1"])
         _, acts, _, _ = policy.act([p0, p1])
@@ -175,8 +83,14 @@ def evaluate(
     seed: int = 0,
     log_dir: Optional[str] = None,
 ) -> Dict[str, float]:
+    """
+    Evaluate a policy in self-play on the repeated PD environment.
+    Returns average payoffs and cooperation rate.
+    """
     import numpy as np
-    os.makedirs(log_dir, exist_ok=True) if log_dir else None
+
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
     avg_pay, coop, total_moves = [], 0, 0
     ep_rows: List[Tuple[int, float, float, float]] = []
@@ -197,10 +111,13 @@ def evaluate(
     avg1 = float(np.mean([y for _, y in avg_pay])) if avg_pay else 0.0
     coop_rate = coop / max(1, total_moves)
 
-    metrics = {"avg_payoff_agent0": avg0, "avg_payoff_agent1": avg1, "cooperation_rate": coop_rate}
+    metrics = {
+        "avg_payoff_agent0": avg0,
+        "avg_payoff_agent1": avg1,
+        "cooperation_rate": coop_rate,
+    }
 
     if log_dir:
-        # episode-level CSV
         with open(os.path.join(log_dir, "episodes.csv"), "w", newline="") as f:
             w = csv.writer(f, delimiter=",")
             w.writerow(["episode", "ret_agent0", "ret_agent1", "coop_rate"])
@@ -212,190 +129,458 @@ def evaluate(
     return metrics
 
 
-# ----------------------------
-# GRPO training
-# ----------------------------
-def grpo_train_selfplay(
+# ---------------------------------------------------------------------
+# Episode-level prompts and parsing (full-game generation)
+# ---------------------------------------------------------------------
+
+
+def format_pd_episode_prompt(
+    tokenizer, env_cfg: EnvConfig, uid: Optional[str] = None
+) -> str:
+    """
+    Build a chat-style prompt asking the model to generate the *entire episode*
+    of a repeated PD between agent_0 and agent_1.
+    """
+    system_msg = (
+        "You are simulating a repeated Prisoner's Dilemma between two agents, "
+        "agent_0 and agent_1. "
+        f"The game lasts exactly {env_cfg.rounds} rounds. "
+        "For each round i, you must output a line in the format:\n"
+        "Round i: A0 A1\n"
+        "where A0 is agent_0's action and A1 is agent_1's action, "
+        "each either 'C' (cooperate) or 'D' (defect).\n"
+        "You may optionally include brief commentary after the actions on the same line, "
+        "but the first two action tokens after 'Round i:' must be A0 and A1."
+    )
+
+    user_content = (
+        "Generate a complete sequence of actions for the entire game.\n"
+        "Remember: exactly one line per round, starting from Round 1 up to Round "
+        f"{env_cfg.rounds}. Use only 'C' or 'D' for the actions.\n"
+        "For example, a line should look like:\n"
+        "Round i: A0 A1\n"
+        "where A0, A1 are placeholders that you must replace with 'C' or 'D'.\n"
+        "Do not skip rounds."
+    )
+
+    if uid is not None:
+        user_content += f"\n\n<ID><UID:{uid}></ID>"
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_content},
+    ]
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+
+_ROUND_LINE_RE = re.compile(
+    r"round\s*(\d+)\s*:\s*([cCdD])\s+([cCdD])",
+    re.IGNORECASE,
+)
+_PAIR_RE = re.compile(r"\b([cCdD])\s+([cCdD])\b")
+
+
+def parse_episode_actions(text: str, rounds: int) -> List[Tuple[str, str]]:
+    """
+    Parse an episode completion into a list of (a0, a1) actions for each round.
+    """
+    actions: List[Tuple[str, str]] = []
+
+    for line in text.splitlines():
+        m = _ROUND_LINE_RE.search(line)
+        if m:
+            a0, a1 = m.group(2).upper(), m.group(3).upper()
+            actions.append((a0, a1))
+
+    if len(actions) < rounds:
+        for m in _PAIR_RE.finditer(text):
+            a0, a1 = m.group(1).upper(), m.group(2).upper()
+            actions.append((a0, a1))
+            if len(actions) >= rounds:
+                break
+
+    if not actions:
+        return []
+
+    actions = actions[:rounds]
+    if len(actions) < rounds:
+        actions.extend([("D", "D")] * (rounds - len(actions)))
+
+    return actions
+
+
+def pd_episode_reward_func(
+    completions: List[str],
+    *,
+    env_cfg: EnvConfig,
+    invalid_penalty: float = -0.5,
+) -> List[float]:
+    """
+    Episode-level reward: each completion is treated as a *full game transcript*.
+    """
+    T, R, P, S = env_cfg.T, env_cfg.R, env_cfg.P, env_cfg.S
+    denom = max(T - S, 1e-6)
+    rewards: List[float] = []
+
+    for i, comp in enumerate(completions):
+        actions = parse_episode_actions(comp or "", env_cfg.rounds)
+        if not actions:
+            r_invalid = max(0.0, min(1.0, invalid_penalty))
+            rewards.append(r_invalid)
+            continue
+
+        e_cfg = EnvConfig(**{**env_cfg.__dict__, "seed": env_cfg.seed + i})
+        env = RepeatedPD(e_cfg)
+        env.reset()
+
+        total0 = 0.0
+        total1 = 0.0
+
+        for a0, a1 in actions:
+            if a0 not in ACTIONS:
+                a0 = "D"
+            if a1 not in ACTIONS:
+                a1 = "D"
+            _, (r0, r1), done = env.step(a0, a1)
+            total0 += r0
+            total1 += r1
+            if done:
+                break
+
+        steps = env.t
+        if steps == 0:
+            r_invalid = max(0.0, min(1.0, invalid_penalty))
+            rewards.append(r_invalid)
+            continue
+
+        avg_self_both = (total0 + total1) / (2.0 * steps)
+        welfare = (avg_self_both - S) / denom
+        val = float(max(0.0, min(1.0, welfare)))
+        rewards.append(val)
+
+    return rewards
+
+
+def collect_episode_prompts(
+    env_cfg: EnvConfig,
+    tokenizer,
+    episodes: int,
+    seed: int = 0,
+) -> Dataset:
+    """
+    Build a Dataset where each row is a single prompt asking the model to
+    generate an entire PD episode (all rounds).
+    """
+    rng = random.Random(seed)
+    _ = rng
+
+    prompts: List[str] = []
+    for _e in range(episodes):
+        uid = make_uid()
+        prompt = format_pd_episode_prompt(tokenizer, env_cfg, uid=uid)
+        prompts.append(prompt)
+
+    ds = Dataset.from_dict({"prompt": prompts})
+    return ds
+
+
+# ---------------------------------------------------------------------
+# Reward model wrapper for PPO (episode-level PD reward)
+# ---------------------------------------------------------------------
+
+
+class PDRewardModel(nn.Module):
+    """
+    Wrapper turning the hand-crafted PD episode reward into a
+    transformers-compatible "reward model" for PPOTrainer.
+    """
+
+    def __init__(self, tokenizer, env_cfg: EnvConfig, invalid_penalty: float = -0.5):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.env_cfg = env_cfg
+        self.invalid_penalty = invalid_penalty
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        device = input_ids.device
+        texts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+
+        rewards = pd_episode_reward_func(
+            texts,
+            env_cfg=self.env_cfg,
+            invalid_penalty=self.invalid_penalty,
+        )
+
+        scores = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(-1)
+        return SequenceClassifierOutput(logits=scores)
+
+
+# ---------------------------------------------------------------------
+# PPO training with experimental PPOTrainer (with extra logging)
+# ---------------------------------------------------------------------
+
+
+def ppo_train_selfplay(
     env_cfg: EnvConfig,
     train_cfg: TrainConfig,
-    outer_iters: int = 1,
-    episodes_per_iter: int = 200,
-    save_dir: str = "./grpo_adapter",
+    episodes: int = 200,
+    save_dir: str = "./ppo_adapter",
     log_every_steps: int = 10,
 ):
-    import os, time, json, csv, random
-    from dataclasses import asdict
-    from collections import Counter
+    """
+    PPO training where each PPO "episode" is a *full repeated PD game*
+    generated in one completion, scored by a social-welfare reward.
+    """
+    _log("Entered ppo_train_selfplay")
+    _log(f"Training episodes: {episodes}")
+    _log(f"TrainConfig: {train_cfg}")
+    _log(f"EnvConfig: {env_cfg}")
 
     torch.manual_seed(train_cfg.seed)
+    random.seed(train_cfg.seed)
 
-    # Root/train folder (old structure) + internal per-iter folder
-    root_dir = save_dir
-    iters_dir = os.path.join(root_dir, "iters")
-    os.makedirs(root_dir, exist_ok=True)
-    os.makedirs(iters_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    hist_path = os.path.join(save_dir, "action_hist.csv")
+    sample_path = os.path.join(save_dir, "train_samples.jsonl")
 
-    # learner starts from base; opponent is lagged (frozen copy)
-    learner = LLMPolicy(train_cfg, adapter_dir=None)
-    opponent = LLMPolicy(train_cfg, adapter_dir=None)
+    if not os.path.exists(hist_path):
+        with open(hist_path, "w") as f:
+            f.write(
+                "step,timestamp,total_sequences,C,D,unknown,mean_reward,std_reward\n"
+            )
+        _log(f"Created history CSV at {hist_path}")
+    else:
+        _log(f"History CSV already exists at {hist_path}")
 
-    tokenizer = AutoTokenizer.from_pretrained(train_cfg.model_name, trust_remote_code=True, use_fast=True)
+    # Tokenizer
+    t0 = time.time()
+    _log("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        train_cfg.model_name,
+        trust_remote_code=True,
+        use_fast=True,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    _log(f"Tokenizer loaded in {time.time() - t0:.2f}s")
 
-    peft_cfg = LoraConfig(r=16, lora_alpha=16, lora_dropout=0.05, task_type="CAUSAL_LM")
+    # Dataset of episode prompts
+    _log("Building episode-level dataset...")
+    t0 = time.time()
+    train_ds = collect_episode_prompts(
+        env_cfg,
+        tokenizer=tokenizer,
+        episodes=episodes,
+        seed=train_cfg.seed,
+    )
+    _log(f"Dataset built in {time.time() - t0:.2f}s, size={len(train_ds)}")
 
-    sample_path = os.path.join(root_dir, "train_samples.jsonl")
-    hist_path   = os.path.join(root_dir, "action_hist.csv")
-    if not os.path.exists(hist_path):
-        with open(hist_path, "w") as f:
-            f.write("iter,step,timestamp,total,C,D,unknown,mean_reward,std_reward\n")
+    # Policy model (actor)
+    _log("Loading policy model (CausalLM)...")
+    t0 = time.time()
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        train_cfg.model_name,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    _log(f"Policy model loaded in {time.time() - t0:.2f}s")
 
-    global_step_logs = []
-    total_steps = 0
-    wall = 0.0
+    # Value model (critic)
+    _log("Loading value model (SequenceClassification)...")
+    t0 = time.time()
+    value_model = AutoModelForSequenceClassification.from_pretrained(
+        train_cfg.model_name,
+        num_labels=1,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    _log(f"Value model loaded in {time.time() - t0:.2f}s")
 
-    for it in range(outer_iters):
-        # 1) collect on-policy dataset vs lagged opponent
-        train_ds, uid_meta = collect_selfplay_prompts(
-            env_cfg, learner=learner, opponent=opponent, episodes=episodes_per_iter, seed=train_cfg.seed + it
+    # Reward model: wraps the hand-crafted PD episode reward
+    _log("Instantiating PDRewardModel wrapper...")
+    reward_model = PDRewardModel(tokenizer, env_cfg)
+    reward_model.to(policy_model.device)
+    _log("Reward model ready")
+
+    # LoRA config
+    _log("Creating LoRA config...")
+    peft_cfg = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        task_type="CAUSAL_LM",
+    )
+    _log("LoRA config created")
+
+    # PPO config – extra logging
+    response_len = min(train_cfg.max_new_tokens, 64)
+    _log("Creating PPOConfig...")
+    ppo_args = PPOConfig(
+        output_dir=save_dir,
+        seed=train_cfg.seed,
+        learning_rate=train_cfg.learning_rate,
+        per_device_train_batch_size=train_cfg.mini_batch_size,
+        gradient_accumulation_steps=max(
+            1, train_cfg.batch_size // train_cfg.mini_batch_size
+        ),
+        num_ppo_epochs=train_cfg.grpo_epochs,
+        num_mini_batches=1,
+        total_episodes=episodes,
+        response_length=response_len,
+        temperature=train_cfg.temperature,
+        logging_steps=log_every_steps,
+        remove_unused_columns=False,
+        sft_model_path=train_cfg.model_name,
+        reward_model_path=train_cfg.model_name,
+        num_sample_generations=1,
+    )
+    _log(f"PPOConfig created: {ppo_args}")
+
+    # PPO trainer
+    _log("Initializing PPOTrainer...")
+    t0 = time.time()
+    trainer = PPOTrainer(
+        args=ppo_args,
+        processing_class=tokenizer,
+        model=policy_model,
+        ref_model=None,
+        reward_model=reward_model,
+        train_dataset=train_ds,
+        value_model=value_model,
+        peft_config=peft_cfg,
+    )
+    _log(f"PPOTrainer initialized in {time.time() - t0:.2f}s")
+
+    # ------------------------------------------------------------------
+    # Custom logging: hook into reward model to record action stats
+    # ------------------------------------------------------------------
+    _log("Wrapping reward model forward for extra logging...")
+
+    reward_call_counter = {"n": 0}
+
+    def wrapped_reward_forward(input_ids=None, attention_mask=None, **kwargs):
+        reward_call_counter["n"] += 1
+        call_id = reward_call_counter["n"]
+
+        _log(
+            f"RewardModel forward call #{call_id} "
+            f"(batch_size={input_ids.size(0)}, seq_len={input_ids.size(1)})"
         )
 
-        # 2) wire reward_fn that closes over uid_meta and also writes history
-        call_idx = {"i": 0}
-        def reward_fn(completions, **kwargs):
-            prompts = None
-            for k in ("prompts","queries","input_texts"):
-                if k in kwargs and kwargs[k] is not None:
-                    prompts = kwargs[k]; break
-
-            rewards = pd_reward_func(
-                completions,
-                prompts=prompts,
-                env_cfg=env_cfg,
-                social_reward=train_cfg.social_reward,
-                invalid_penalty=-0.5,
-                long_penalty=-0.05,
-                uid_meta=uid_meta,
-                welfare_lambda=1.0,
+        with torch.no_grad():
+            texts = tokenizer.batch_decode(
+                input_ids, skip_special_tokens=True
             )
 
-            # Old-style per-call histogram
-            parsed = [_parse_action_strict(c) for c in completions]
-            cnt = Counter(a if a in ("C","D") else "unknown" for a in parsed)
-            call_idx["i"] += 1
-            step = call_idx["i"]
-            ts = int(time.time())
-
-            ################# TEMP ##################
-            import numpy as np
-            G = train_cfg.num_generations
-            for q in range(len(completions) // G):
-                group = completions[q*G:(q+1)*G]
-                parsed = [_parse_action_strict(c) for c in group]
-                print(f"query {q}: {parsed}")
-                # optional: group reward std
-                g_rewards = rewards[q*G:(q+1)*G]
-                print(f"  std_reward={np.std(g_rewards):.4f}")
-
-            #########################################
-
-            n = max(1, len(rewards))
-            mean_r = float(sum(rewards) / n)
-            var_r = float(sum((r - mean_r) ** 2 for r in rewards) / n)
-            std_r = var_r ** 0.5
-
-            with open(hist_path, "a") as f:
-                f.write(
-                    f"{it},{step},{ts},{len(completions)},"
-                    f"{cnt.get('C',0)},{cnt.get('D',0)},{cnt.get('unknown',0)},"
-                    f"{mean_r:.6f},{std_r:.6f}\n"
+        # Log first 1–2 sequences of the first calls
+        if call_id <= 3:
+            for i, ttxt in enumerate(texts[:2]):
+                _log(
+                    f"[reward_call {call_id}] sample {i} decoded prefix: "
+                    f"{ttxt[:200].replace(chr(10), ' ')}"
                 )
 
-            # ~5% sampling to jsonl
-            with open(sample_path, "a") as f:
-                for i, (c, r, a) in enumerate(zip(completions, rewards, parsed)):
-                    if random.random() < 0.05:
-                        row = {"outer_iter": it, "step": step, "completion": c, "parsed": a, "reward": r}
-                        if prompts is not None and i < len(prompts):
-                            row["prompt"] = prompts[i]
-                        f.write(json.dumps(row) + "\n")
-
-            return rewards
-        
-        print(f"TRAINING WITH TEMPERATURE: {train_cfg.temperature}")
-
-        args = GRPOConfig(
-            output_dir=os.path.join(iters_dir, f"iter_{it:02d}"),
-            seed=train_cfg.seed,
-            learning_rate=train_cfg.learning_rate,
-            per_device_train_batch_size=train_cfg.mini_batch_size,
-            gradient_accumulation_steps=max(1, train_cfg.batch_size // train_cfg.mini_batch_size),
-            num_train_epochs=train_cfg.grpo_epochs,
-            max_prompt_length=256,
-            max_completion_length=train_cfg.max_new_tokens,
-            num_generations=max(8, train_cfg.num_generations),
-            temperature=train_cfg.temperature,
-            # top_p=0.9,
-            top_p=1.0,
-            remove_unused_columns=False,
-            logging_steps=log_every_steps,
-            save_steps=0,
-            model_init_kwargs={
-                "trust_remote_code": True,
-                "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            },
+        rewards = pd_episode_reward_func(
+            texts,
+            env_cfg=env_cfg,
+            invalid_penalty=-0.5,
         )
 
-        trainer = GRPOTrainer(
-            model=train_cfg.model_name,
-            reward_funcs=reward_fn,
-            train_dataset=train_ds,
-            processing_class=tokenizer,
-            args=args,
-            peft_config=peft_cfg,
+        action_counts = Counter()
+        for txt in texts:
+            seq = parse_episode_actions(txt or "", env_cfg.rounds)
+            if not seq:
+                action_counts["unknown"] += 1
+                continue
+            for a0, a1 in seq:
+                if a0 in ("C", "D"):
+                    action_counts[a0] += 1
+                else:
+                    action_counts["unknown"] += 1
+                if a1 in ("C", "D"):
+                    action_counts[a1] += 1
+                else:
+                    action_counts["unknown"] += 1
+
+        n = max(1, len(rewards))
+        mean_r = float(sum(rewards) / n)
+        var_r = float(sum((r - mean_r) ** 2 for r in rewards) / n)
+        std_r = var_r**0.5
+
+        step = trainer.state.global_step or 0
+        ts = int(time.time())
+
+        _log(
+            f"Reward call #{call_id} -> global_step={step}, "
+            f"mean_reward={mean_r:.3f}, std_reward={std_r:.3f}, "
+            f"C={action_counts.get('C', 0)}, D={action_counts.get('D', 0)}, "
+            f"unknown={action_counts.get('unknown', 0)}"
         )
 
-        t0 = time.time()
-        trainer.train()
-        wall += time.time() - t0
+        with open(hist_path, "a") as f:
+            f.write(
+                f"{step},{ts},{len(rewards)},"
+                f"{action_counts.get('C', 0)},{action_counts.get('D', 0)},{action_counts.get('unknown', 0)},"
+                f"{mean_r:.6f},{std_r:.6f}\n"
+            )
 
-        # Save per-iter adapter + tokenizer inside /iters/iter_XX
-        trainer.save_model(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+        with open(sample_path, "a") as f:
+            for txt, r in zip(texts, rewards):
+                if random.random() < 0.05:
+                    row = {
+                        "step": step,
+                        "completion": txt,
+                        "reward": r,
+                    }
+                    f.write(json.dumps(row) + "\n")
 
-        # Accumulate logs with an 'outer_iter' tag (helps CSV/JSON downstream)
-        for row in trainer.state.log_history:
-            row = dict(row)  # shallow copy
-            row["outer_iter"] = it
-            global_step_logs.append(row)
-        total_steps += trainer.state.global_step or 0
+        device = input_ids.device
+        scores = torch.tensor(
+            rewards, dtype=torch.float32, device=device
+        ).unsqueeze(-1)
+        return SequenceClassifierOutput(logits=scores)
 
-        # Refresh learner/opponent to latest adapter
-        learner = LLMPolicy(train_cfg, adapter_dir=args.output_dir)
-        opponent = LLMPolicy(train_cfg, adapter_dir=args.output_dir)
+    reward_model.forward = wrapped_reward_forward  # type: ignore[assignment]
+    _log("Reward model wrapped. Starting PPO training...")
 
-    # Save the latest adapter + tokenizer directly into root_dir
-    learner.model.save_pretrained(root_dir)
-    tokenizer.save_pretrained(root_dir)
+    # Train
+    t0 = time.time()
+    trainer.train()
+    _log(f"PPO training finished in {time.time() - t0:.2f}s")
 
-    # Persist trainer-style logs/configs in root_dir
-    with open(os.path.join(root_dir, "train_config.json"), "w") as f:
+    # Save adapter / tokenizer in save_dir so LLMPolicy(adapter_dir=...) can load it
+    _log("Saving trained policy + tokenizer...")
+    trainer.save_model(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    _log("Models saved")
+
+    # Also save configs + log history
+    _log("Saving configs and log history...")
+    with open(os.path.join(save_dir, "train_config.json"), "w") as f:
         json.dump(asdict(train_cfg), f, indent=2)
-    with open(os.path.join(root_dir, "env_config.json"), "w") as f:
+    with open(os.path.join(save_dir, "env_config.json"), "w") as f:
         json.dump(asdict(env_cfg), f, indent=2)
-    with open(os.path.join(root_dir, "log_history.json"), "w") as f:
-        json.dump(global_step_logs, f, indent=2)
-    with open(os.path.join(root_dir, "meta.json"), "w") as f:
-        json.dump({"wall_time_sec": wall, "steps": total_steps}, f, indent=2)
+    with open(os.path.join(save_dir, "log_history.json"), "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
 
-    csv_path = os.path.join(root_dir, "train_history.csv")
-    keys = sorted({k for d in global_step_logs for k in d.keys()})
+    csv_path = os.path.join(save_dir, "train_history.csv")
+    keys = sorted({k for d in trainer.state.log_history for k in d.keys()})
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
-        for row in global_step_logs:
+        for row in trainer.state.log_history:
             w.writerow(row)
+    _log(f"Train history CSV written to {csv_path}")
 
-    return learner, global_step_logs
+    learner = LLMPolicy(train_cfg, adapter_dir=save_dir)
+    _log("ppo_train_selfplay complete – returning learner + log history")
+    return learner, trainer.state.log_history

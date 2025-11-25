@@ -1,7 +1,14 @@
 from __future__ import annotations
-import os, json, argparse, datetime
-from training.grpo_pd import TrainConfig, LLMPolicy, evaluate, grpo_train_selfplay
+
+import argparse
+import datetime
+import json
+import os
+
+from config import TrainConfig
 from envs.repeated_pd import Config as EnvConfig
+from policy.llm_policy import LLMPolicy
+from training.grpo_pd import evaluate, ppo_train_selfplay
 
 
 def save_json(path, obj):
@@ -19,8 +26,8 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--minibatch", type=int, default=16)
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--num_generations", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=1)  # PPO epochs per update
+    ap.add_argument("--num_generations", type=int, default=8)  # unused, kept for compat
     ap.add_argument("--max_new_tokens", type=int, default=2)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--social_reward", action="store_true", default=True)
@@ -55,43 +62,60 @@ def main():
 
     # Configs
     env_cfg = EnvConfig(
-        rounds=args.rounds, T=args.T, R=args.R, P=args.P, S=args.S,
-        action_error=args.noise, seed=args.seed
+        rounds=args.rounds,
+        T=args.T,
+        R=args.R,
+        P=args.P,
+        S=args.S,
+        action_error=args.noise,
+        seed=args.seed,
     )
     tcfg = TrainConfig(
         model_name=args.model,
         learning_rate=args.lr,
         batch_size=args.batch,
         mini_batch_size=args.minibatch,
-        grpo_epochs=args.epochs,
+        grpo_epochs=args.epochs,  # reused as ppo_epochs
         seed=args.seed,
         max_new_tokens=args.max_new_tokens,
         do_sample=True,
         temperature=args.temperature,
         social_reward=args.social_reward,
-        num_generations=args.num_generations,
     )
 
-    # 1) Baseline evaluation
+    # 1) Baseline evaluation (no RL fine-tuning)
     base_policy = LLMPolicy(tcfg)
-    base_metrics = evaluate(env_cfg, base_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=base_dir)
+    base_metrics = evaluate(
+        env_cfg, base_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=base_dir
+    )
 
-    # 2) Training (GRPO)
-    policy, _ = grpo_train_selfplay(env_cfg, tcfg, save_dir=train_dir, episodes_per_iter=args.train_episodes)
+    # 2) PPO training with intrinsic reward on the repeated PD
+    _, train_logs = ppo_train_selfplay(
+        env_cfg,
+        tcfg,
+        episodes=args.train_episodes,
+        save_dir=train_dir,
+    )
 
-    # 3) Post-training evaluation
+    # 3) Post-training evaluation (load fine-tuned checkpoint)
     tuned_policy = LLMPolicy(tcfg, adapter_dir=train_dir)
-    post_metrics = evaluate(env_cfg, tuned_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=post_dir)
+    post_metrics = evaluate(
+        env_cfg, tuned_policy, episodes=args.eval_episodes, seed=args.seed, log_dir=post_dir
+    )
 
     # Manifest + comparison
     save_json(os.path.join(run_dir, "env_config.json"), env_cfg.__dict__)
     save_json(os.path.join(run_dir, "train_config.json"), tcfg.__dict__)
     save_json(os.path.join(run_dir, "baseline_metrics.json"), base_metrics)
     save_json(os.path.join(run_dir, "post_metrics.json"), post_metrics)
+
     diff = {
-        "avg_payoff_agent0_gain": post_metrics["avg_payoff_agent0"] - base_metrics["avg_payoff_agent0"],
-        "avg_payoff_agent1_gain": post_metrics["avg_payoff_agent1"] - base_metrics["avg_payoff_agent1"],
-        "coop_rate_gain": post_metrics["cooperation_rate"] - base_metrics["cooperation_rate"],
+        "avg_payoff_agent0_gain": post_metrics["avg_payoff_agent0"]
+        - base_metrics["avg_payoff_agent0"],
+        "avg_payoff_agent1_gain": post_metrics["avg_payoff_agent1"]
+        - base_metrics["avg_payoff_agent1"],
+        "coop_rate_gain": post_metrics["cooperation_rate"]
+        - base_metrics["cooperation_rate"],
     }
     save_json(os.path.join(run_dir, "comparison.json"), diff)
 
