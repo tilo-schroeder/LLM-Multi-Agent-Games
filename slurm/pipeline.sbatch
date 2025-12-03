@@ -24,7 +24,7 @@ MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 SEED="${SEED:-0}"
 
 # Env params
-ROUNDS="${ROUNDS:-20}"
+ROUNDS="${ROUNDS:-10}"
 T="${T:-5.0}"
 R="${R:-3.0}"
 P="${P:-1.0}"
@@ -41,7 +41,7 @@ BATCH="${BATCH:-64}"
 MINIBATCH="${MINIBATCH:-16}"
 EPOCHS="${EPOCHS:-1}"
 NUMGEN="${NUMGEN:-8}"
-MAXTOK="${MAXTOK:-10}"
+MAXTOK="${MAXTOK:-1000}"
 TEMPERATURE="${TEMPERATURE:-1.2}"
 SOCIAL="${SOCIAL:-true}"
 
@@ -50,7 +50,9 @@ if [ "$SOCIAL" != "true" ]; then
   SOC_FLAG="--no_social_reward"
 fi
 
-python -m scripts.run_pipeline \
+COOP_BONUS="${COOP_BONUS:-0.0}"
+
+python -m scripts.run_pipeline_two_agents \
   --model "$MODEL" --seed "$SEED" \
   --rounds "$ROUNDS" --T "$T" --R "$R" --P "$P" --S "$S" --noise "$NOISE" \
   --eval_episodes "$EVAL_EP" --train_episodes "$TRAIN_EP" \
@@ -58,6 +60,7 @@ python -m scripts.run_pipeline \
   --num_generations "$NUMGEN" --max_new_tokens "$MAXTOK" \
   $SOC_FLAG \
   --outdir "$OUTDIR" \
-  --temperature "$TEMPERATURE"
+  --temperature "$TEMPERATURE" \
+  --coop_bonus "$COOP_BONUS"
 
 echo "Done."
