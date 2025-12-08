@@ -11,7 +11,7 @@ class StagHuntConfig:
     num_players: int = 2
     num_rounds: int = 5
     R_stag_stag: float = 4.0
-    R_hare_hare: float = 2.0
+    R_hare_hare: float = 1.0
     R_stag_hare: float = 0.0
     R_hare_stag: float = 3.0
 

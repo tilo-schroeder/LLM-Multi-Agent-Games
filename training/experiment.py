@@ -23,8 +23,8 @@ Key changes vs original:
 import os
 import json
 import csv
-import random
 import logging
+import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 
@@ -124,15 +124,6 @@ def compute_moral_reward_stag_hunt(
 # =======================================
 # Local decision prompting & parsing
 # =======================================
-
-# def format_history_for_player(history: List[Tuple[str, str]]) -> str:
-#     """Format past rounds in a natural language way."""
-#     if not history:
-#         return "No previous rounds have been played.\n"
-#     lines = []
-#     for t, (a1, a2) in enumerate(history, start=1):
-#         lines.append(f"Round {t}: Player 1 chose {a1}, Player 2 chose {a2}.")
-#     return "\n".join(lines) + "\n"
 
 def format_history_for_player(history: List[Tuple[str, str]]) -> str:
     """
@@ -237,6 +228,9 @@ class DecisionSample:
     completion: str
     # reward will be filled after decision; here it's intrinsic/moral reward
     reward: float = 0.0
+    action: str = ""             # "STAG" or "HARE" (parsed action)
+    opp_prev_action: str = ""    # opponent's previous move, "" if none
+    is_legal: bool = True
 
 
 def generate_completion(
@@ -401,26 +395,24 @@ def rollout_episode_vs_tft(
     xi: float = 3.0,
     illegal_penalty: float = -6.0,
 ) -> Tuple[List[DecisionSample], float]:
-    """
-    One episode of: LLM agent (Player 1) vs fixed Tit-for-Tat opponent (Player 2):
 
-    - Episode has a fixed number of decision steps = config.num_rounds.
-    - State is just the previous joint action (random initial state at t=0).
-    - Illegal actions receive R_illegal and DO NOT update the environment/opponent state.
-    """
     env = StagHuntEnv(config)
-    # Random initial state as in Section 3.2 of the paper
     obs = env.reset(random_initial_state=True)
     opponent.reset()
 
     samples: List[DecisionSample] = []
-    total_moral_return = 0.0
+    step_rewards: List[float] = []
 
-    # Fixed-horizon episode: num_rounds decisions (legal or illegal)
     for t in range(config.num_rounds):
-        round_idx = t + 1  # decision index within the episode
+        round_idx = t + 1
 
-        # --- Agent (Player 1) chooses ---
+        # --- NEW: get opponent's previous action from current obs ---
+        history = obs["history"]
+        opp_prev_action = None
+        if history:
+            _, last_a2 = history[-1]
+            opp_prev_action = last_a2
+
         prompt = build_decision_prompt(1, obs, config, tokenizer)
         completion = generate_completion(
             model, tokenizer, prompt, device,
@@ -428,27 +420,24 @@ def rollout_episode_vs_tft(
         )
         action_p1, is_legal = extract_action_from_completion(completion)
 
+        # --- NEW: store action, opp_prev_action, legality in sample ---
         sample = DecisionSample(
             episode_id=episode_id,
             player_id=1,
             round_idx=round_idx,
             prompt=prompt,
             completion=completion,
-            reward=0.0,  # set below
+            reward=0.0,      # will fill later
+            action=action_p1,
+            opp_prev_action=opp_prev_action or "",
+            is_legal=is_legal,
         )
 
-        # Previous opponent action from *state* history (obs), not raw env.history
-        opp_prev_action = None
-        history = obs["history"]
-        if history:
-            _, last_a2 = history[-1]
-            opp_prev_action = last_a2
-
         if not is_legal:
-            # === Illegal move: give penalty, do NOT update env/opponent or state ===
+            # Illegal action → no env step; apply penalty reward only
             moral_r = compute_moral_reward_stag_hunt(
                 moral_type=moral_type,
-                agent_action=StagHuntEnv.ACTION_HARE,  # dummy, unused when is_legal=False
+                agent_action=StagHuntEnv.ACTION_HARE,
                 opp_prev_action=opp_prev_action,
                 r_agent=0.0,
                 r_opp=0.0,
@@ -456,19 +445,15 @@ def rollout_episode_vs_tft(
                 xi=xi,
                 illegal_penalty=illegal_penalty,
             )
-            sample.reward = moral_r
-            total_moral_return += moral_r
+            step_rewards.append(moral_r)
             samples.append(sample)
-
+            # state does NOT change
             continue
 
-        # --- Opponent (Player 2) chooses (Tit-for-Tat) using current state ---
+        # legal action → opponent acts, env steps
         action_p2 = opponent.act(obs)
-
-        # --- Environment step for legal actions only ---
         obs, (r1, r2), done, info = env.step(action_p1, action_p2)
 
-        # --- Moral reward for this (legal) decision ---
         moral_r = compute_moral_reward_stag_hunt(
             moral_type=moral_type,
             agent_action=action_p1,
@@ -480,90 +465,17 @@ def rollout_episode_vs_tft(
             illegal_penalty=illegal_penalty,
         )
 
-        sample.reward = moral_r
-        total_moral_return += moral_r
+        step_rewards.append(moral_r)
         samples.append(sample)
 
+    total_moral_return = float(sum(step_rewards))
+
+    # for s in samples:
+    #     s.reward = total_moral_return
+    for s, r in zip(samples, step_rewards):
+        s.reward = r                # purely local reward
+
     return samples, total_moral_return
-
-# def rollout_episode_vs_tft(
-#     model,
-#     tokenizer,
-#     config: StagHuntConfig,
-#     device: torch.device,
-#     episode_id: int,
-#     moral_type: str,
-#     opponent: TitForTatOpponent,
-#     temperature: float = 0.7,
-#     top_p: float = 0.9,
-#     xi: float = 3.0,
-#     illegal_penalty: float = -6.0,
-# ) -> Tuple[List[DecisionSample], float]:
-#     """
-#     One episode of: LLM agent (Player 1) vs fixed Tit-for-Tat opponent (Player 2).
-
-#     Returns:
-#         - list of DecisionSample for Player 1, each with per-step moral reward
-#         - total (undiscounted) moral return over the episode for Player 1
-#     """
-#     env = StagHuntEnv(config)
-#     obs = env.reset()
-#     opponent.reset()
-
-#     samples: List[DecisionSample] = []
-#     done = False
-#     total_moral_return = 0.0
-
-#     while not done:
-#         round_idx = obs["round"] + 1
-
-#         # --- Agent (Player 1) chooses ---
-#         prompt = build_decision_prompt(1, obs, config, tokenizer)
-#         completion = generate_completion(
-#             model, tokenizer, prompt, device,
-#             temperature=temperature, top_p=top_p,
-#         )
-#         action_p1, is_legal = extract_action_from_completion(completion)
-
-#         sample = DecisionSample(
-#             episode_id=episode_id,
-#             player_id=1,
-#             round_idx=round_idx,
-#             prompt=prompt,
-#             completion=completion,
-#             reward=0.0,  # set below
-#         )
-
-#         # --- Opponent (Player 2) chooses (Tit-for-Tat) ---
-#         action_p2 = opponent.act(obs)
-
-#         # Previous opponent action (for deontological norm)
-#         opp_prev_action = None
-#         history = env.history
-#         if history:
-#             _, last_a2 = history[-1]
-#             opp_prev_action = last_a2
-
-#         # --- Environment step ---
-#         obs, (r1, r2), done, info = env.step(action_p1, action_p2)
-
-#         # --- Moral reward for this decision ---
-#         moral_r = compute_moral_reward_stag_hunt(
-#             moral_type=moral_type,
-#             agent_action=action_p1,
-#             opp_prev_action=opp_prev_action,
-#             r_agent=r1,
-#             r_opp=r2,
-#             is_legal=is_legal,
-#             xi=xi,
-#             illegal_penalty=illegal_penalty,
-#         )
-
-#         sample.reward = moral_r
-#         total_moral_return += moral_r
-#         samples.append(sample)
-
-#     return samples, total_moral_return
 
 
 def collect_batch_moral_vs_tft(
@@ -685,9 +597,10 @@ def compute_logprob_for_sample(
 def train_grpo_stag_hunt_local():
     # ---- Config ----
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    # model_name = "Qwen/Qwen3-4B-Instruct-2507"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    output_dir = "./runs/setup_test"
+    output_dir = "./runs/setup_test_utilitarian_long"
     log_dir = os.path.join(output_dir, "logs")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -697,7 +610,7 @@ def train_grpo_stag_hunt_local():
         num_players=2,
         num_rounds=5,
         R_stag_stag=4.0,
-        R_hare_hare=2.0,
+        R_hare_hare=1.0,
         R_stag_hare=0.0,
         R_hare_stag=3.0,
     )
@@ -706,9 +619,9 @@ def train_grpo_stag_hunt_local():
     #   "game", "deontological", "utilitarian", "game+deontological"
     moral_type = "utilitarian"
 
-    num_updates = 65      # gradient updates
+    num_updates = 30      # gradient updates
     episodes_per_batch = 8
-    lr = 1e-4
+    lr = 1e-5
     max_grad_norm = 1.0
 
     logger.info("Starting GRPO Stag Hunt training (moral agent vs Tit-for-Tat)")
@@ -751,6 +664,18 @@ def train_grpo_stag_hunt_local():
         "global_stag_rate": [],
     }
 
+    action_categories = [
+        "STAG|STAG",    # P1 STAG, opp previously STAG
+        "STAG|HARE",    # P1 STAG, opp previously HARE
+        "HARE|STAG",    # P1 HARE, opp previously STAG
+        "HARE|HARE",    # P1 HARE, opp previously HARE
+        "illegal|STAG", # illegal completion, opp previously STAG
+        "illegal|HARE", # illegal completion, opp previously HARE
+    ]
+    action_stats = {"episode": []}
+    for cat in action_categories:
+        action_stats[cat] = []
+
     for update in range(1, num_updates + 1):
         logger.info(f"=== Running update {update}/{num_updates} ===")
 
@@ -767,7 +692,7 @@ def train_grpo_stag_hunt_local():
             device=device,
             num_episodes=episodes_per_batch,
             moral_type=moral_type,
-            temperature=0.7,
+            temperature=1.7,
             top_p=0.9,
             logger=logger,
         )
@@ -807,6 +732,36 @@ def train_grpo_stag_hunt_local():
 
         optimizer.step()
         scheduler.step()
+
+        for ep_local in range(episodes_per_batch):
+            global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
+
+            counts = {cat: 0 for cat in action_categories}
+
+            for s in samples:
+                if s.episode_id != ep_local:
+                    continue
+
+                # we only care if we know the opponent's previous move
+                if s.opp_prev_action not in (
+                    StagHuntEnv.ACTION_STAG,
+                    StagHuntEnv.ACTION_HARE,
+                ):
+                    continue
+
+                opp = s.opp_prev_action  # "STAG" or "HARE"
+                if not s.is_legal:
+                    key = f"illegal|{opp}"
+                else:
+                    act = s.action or extract_action_from_completion(s.completion)[0]
+                    key = f"{act}|{opp}"
+
+                if key in counts:
+                    counts[key] += 1
+
+            action_stats["episode"].append(global_ep_idx)
+            for cat in action_categories:
+                action_stats[cat].append(counts[cat])
 
         # === compute cooperation statistics ===
         total_samples = len(samples)
@@ -895,6 +850,38 @@ def train_grpo_stag_hunt_local():
     plt.savefig(coop_curve_path, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved cooperation curve plot to {coop_curve_path}")
+
+
+    episodes_for_plot = action_stats["episode"]
+    if len(episodes_for_plot) > 0:
+        cat_keys = action_categories  # preserve order
+        counts_array = np.vstack([action_stats[k] for k in cat_keys])  # [6, num_eps]
+
+        plt.figure(figsize=(12, 4))
+        bottoms = np.zeros(len(episodes_for_plot))
+
+        for i, cat in enumerate(cat_keys):
+            vals = counts_array[i]
+            plt.bar(
+                episodes_for_plot,
+                vals,
+                bottom=bottoms,
+                label=cat,
+                width=1.0,
+            )
+            bottoms += vals
+
+        plt.xlabel("Episode")
+        plt.ylabel("Count of actions per episode")
+        plt.title(f"P1 actions vs TFT conditioned on opponent's previous move ({moral_type})")
+        plt.legend(loc="upper right", fontsize=7)
+        plt.grid(axis="y", linestyle="--", alpha=0.5)
+
+        fig3_path = os.path.join(log_dir, "figure3_style_actions_vs_opp_prev.png")
+        plt.savefig(fig3_path, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Saved Figure-3-style action distribution plot to {fig3_path}")
+
 
     # Save fine-tuned model
     model.save_pretrained(output_dir)
