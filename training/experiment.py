@@ -24,6 +24,7 @@ import os
 import json
 import csv
 import logging
+import argparse
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
@@ -42,6 +43,101 @@ from utils.logging_utils import get_logger
 import matplotlib
 matplotlib.use("Agg")  # safe for SLURM/non-GUI environments
 import matplotlib.pyplot as plt
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Self-play GRPO-style finetuning on repeated Stag Hunt."
+    )
+
+    # High-level setup
+    parser.add_argument(
+        "--setup",
+        type=str,
+        choices=["tft", "two_llm"],
+        default="tft",
+        help='Training setup: "tft" (LLM vs Tit-for-Tat) or "two_llm" (two learning LLMs).',
+    )
+
+    # Models
+    parser.add_argument(
+        "--model_p1",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Base model name for Player 1 (HF repo id or local path).",
+    )
+    parser.add_argument(
+        "--model_p2",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Base model name for Player 2 (if None, use model_p1).",
+    )
+
+    # Temperature / sampling
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for generation.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) sampling parameter.",
+    )
+
+    # Reward / moral type
+    parser.add_argument(
+        "--moral_type",
+        type=str,
+        choices=["game", "deontological", "utilitarian", "game+deontological"],
+        default="utilitarian",
+        help="Type of intrinsic/moral reward.",
+    )
+
+    # Training hyperparameters
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate.",
+    )
+    parser.add_argument(
+        "--num_updates",
+        type=int,
+        default=30,
+        help="Number of gradient updates.",
+    )
+    parser.add_argument(
+        "--episodes_per_batch",
+        type=int,
+        default=8,
+        help="Number of episodes collected per update.",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm.",
+    )
+
+    # Environment config
+    parser.add_argument(
+        "--num_rounds",
+        type=int,
+        default=5,
+        help="Number of repeated rounds in the Stag Hunt game.",
+    )
+
+    # Output / logging
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./runs/tft_utilitarian_with_full_logging",
+        help="Directory to save models, logs, and plots.",
+    )
+
+    return parser.parse_args()
 
 
 # =======================================
@@ -277,13 +373,14 @@ def rollout_episode_vs_tft(
     top_p: float = 0.9,
     xi: float = 3.0,
     illegal_penalty: float = -6.0,
-) -> Tuple[List[DecisionSample], float, int, int]:
+) -> Tuple[List[DecisionSample], float, List[float], int, int]:
     """
     Returns:
-        samples: list of DecisionSample for Player 1
-        total_moral_return: sum of moral rewards for the episode
-        p2_stag_count: how many times TFT played STAG (when it acted)
-        p2_total_actions: how many times TFT acted (i.e., env stepped)
+        samples: DecisionSample list for Player 1
+        total_moral_p1: sum of P1 moral rewards
+        tft_rewards: list of TFT (P2) moral rewards for each env step
+        p2_stag_count: how many times TFT played STAG
+        p2_total_actions: how many times TFT acted (env steps)
     """
 
     env = StagHuntEnv(config)
@@ -291,7 +388,8 @@ def rollout_episode_vs_tft(
     opponent.reset()
 
     samples: List[DecisionSample] = []
-    step_rewards: List[float] = []
+    step_rewards_p1: List[float] = []
+    step_rewards_p2: List[float] = []
 
     p2_stag_count = 0
     p2_total_actions = 0
@@ -299,12 +397,14 @@ def rollout_episode_vs_tft(
     for t in range(config.num_rounds):
         round_idx = t + 1
 
-        # --- get opponent's previous action from current obs ---
         history = obs["history"]
+
+        # From P1's perspective:
         opp_prev_action = None
+        prev_a1, prev_a2 = (None, None)
         if history:
-            _, last_a2 = history[-1]
-            opp_prev_action = last_a2
+            prev_a1, prev_a2 = history[-1]
+            opp_prev_action = prev_a2  # P2's last action
 
         prompt = build_decision_prompt(1, obs, config, tokenizer)
         completion = generate_completion(
@@ -326,8 +426,8 @@ def rollout_episode_vs_tft(
         )
 
         if not is_legal:
-            # Illegal action → no env step; apply penalty reward only
-            moral_r = compute_moral_reward_stag_hunt(
+            # Illegal action → no env step; penalty for P1 only
+            moral_r1 = compute_moral_reward_stag_hunt(
                 moral_type=moral_type,
                 agent_action=StagHuntEnv.ACTION_HARE,
                 opp_prev_action=opp_prev_action,
@@ -337,22 +437,22 @@ def rollout_episode_vs_tft(
                 xi=xi,
                 illegal_penalty=illegal_penalty,
             )
-            step_rewards.append(moral_r)
+            step_rewards_p1.append(moral_r1)
             samples.append(sample)
-            # state does NOT change, TFT does not act
+            # TFT does not act; no P2 reward for this "round"
             continue
 
-        # legal action → opponent acts, env steps
+        # legal → TFT acts, env steps
         action_p2 = opponent.act(obs)
 
-        # track TFT's action stats
         p2_total_actions += 1
         if action_p2 == StagHuntEnv.ACTION_STAG:
             p2_stag_count += 1
 
         obs, (r1, r2), done, info = env.step(action_p1, action_p2)
 
-        moral_r = compute_moral_reward_stag_hunt(
+        # P1 moral reward
+        moral_r1 = compute_moral_reward_stag_hunt(
             moral_type=moral_type,
             agent_action=action_p1,
             opp_prev_action=opp_prev_action,
@@ -363,14 +463,29 @@ def rollout_episode_vs_tft(
             illegal_penalty=illegal_penalty,
         )
 
-        step_rewards.append(moral_r)
+        # TFT moral reward (treat TFT as agent, P1 as opponent)
+        moral_r2 = compute_moral_reward_stag_hunt(
+            moral_type=moral_type,
+            agent_action=action_p2,
+            opp_prev_action=prev_a1,  # previous P1 move
+            r_agent=r2,
+            r_opp=r1,
+            is_legal=True,
+            xi=xi,
+            illegal_penalty=illegal_penalty,
+        )
+
+        step_rewards_p1.append(moral_r1)
+        step_rewards_p2.append(moral_r2)
         samples.append(sample)
 
-    total_moral_return = float(sum(step_rewards))
-    for s, r in zip(samples, step_rewards):
-        s.reward = r  # purely local reward
+    total_moral_p1 = float(sum(step_rewards_p1))
 
-    return samples, total_moral_return, p2_stag_count, p2_total_actions
+    for s, r in zip(samples, step_rewards_p1):
+        s.reward = r
+
+    # Note: step_rewards_p2 can be shorter than samples (no entries for illegal P1 moves)
+    return samples, total_moral_p1, step_rewards_p2, p2_stag_count, p2_total_actions
 
 
 def collect_batch_moral_vs_tft(
@@ -383,14 +498,14 @@ def collect_batch_moral_vs_tft(
     temperature: float = 0.7,
     top_p: float = 0.9,
     logger: logging.Logger = None,
-) -> Tuple[List[DecisionSample], float]:
+) -> Tuple[List[DecisionSample], float, List[float]]:
     """
-    Collect num_episodes of (LLM vs Tit-for-Tat), with intrinsic moral rewards
-    already attached per decision.
+    Collect num_episodes of (LLM vs Tit-for-Tat).
 
     Returns:
-        all_samples: all DecisionSample objects for Player 1 across episodes
-        tft_stag_rate: overall STAG frequency of the TFT opponent in this batch
+        all_samples: DecisionSample list for P1
+        tft_stag_rate: overall STAG rate of TFT in this batch
+        tft_rewards: list of TFT moral rewards for all env steps in batch
     """
     if logger is None:
         logger = get_logger()
@@ -400,10 +515,11 @@ def collect_batch_moral_vs_tft(
 
     total_p2_stags = 0
     total_p2_actions = 0
+    tft_rewards_batch: List[float] = []
 
     for ep_id in range(num_episodes):
         logger.info(f"  Rolling out moral episode {ep_id} (type={moral_type}) vs TFT...")
-        samples, total_moral, p2_stags, p2_actions = rollout_episode_vs_tft(
+        samples, total_moral_p1, tft_rewards_ep, p2_stags, p2_actions = rollout_episode_vs_tft(
             model=model,
             tokenizer=tokenizer,
             config=config,
@@ -415,24 +531,29 @@ def collect_batch_moral_vs_tft(
             top_p=top_p,
         )
         all_samples.extend(samples)
+        tft_rewards_batch.extend(tft_rewards_ep)
 
         total_p2_stags += p2_stags
         total_p2_actions += p2_actions
 
         if ep_id < 2:
-            logger.info(f"    Episode {ep_id} total moral return={total_moral:.3f}")
-            rounds = [(s.round_idx, s.player_id,
-                       extract_action_from_completion(s.completion)[0])
-                      for s in samples]
+            logger.info(f"    Episode {ep_id} total moral return (P1)={total_moral_p1:.3f}")
+            rounds = [
+                (s.round_idx, s.player_id,
+                 extract_action_from_completion(s.completion)[0])
+                for s in samples
+            ]
             logger.info("    Parsed actions (round, player, action):")
             for triple in rounds:
                 logger.info(f"      {triple}")
 
             tft_ep_rate = (p2_stags / p2_actions) if p2_actions > 0 else 0.0
+            tft_ep_mean = (sum(tft_rewards_ep) / len(tft_rewards_ep)) if tft_rewards_ep else 0.0
             logger.info(f"    TFT STAG rate (episode {ep_id})={tft_ep_rate:.3f}")
+            logger.info(f"    TFT mean moral reward (episode {ep_id})={tft_ep_mean:.3f}")
 
     tft_stag_rate = (total_p2_stags / total_p2_actions) if total_p2_actions > 0 else 0.0
-    return all_samples, tft_stag_rate
+    return all_samples, tft_stag_rate, tft_rewards_batch
 
 
 # ===== Moral self-play with TWO separate learning agents =====
@@ -701,7 +822,7 @@ def compute_logprob_for_sample(
     return logprob  # scalar with grad
 
 
-def train_grpo_stag_hunt_local():
+def train_grpo_stag_hunt_local(args):
     """
     Main training loop.
 
@@ -709,17 +830,15 @@ def train_grpo_stag_hunt_local():
       - "tft":     Player 1 (LLM) vs fixed Tit-for-Tat opponent
       - "two_llm": Player 1 (LLM) vs Player 2 (LLM), both learning
     """
-    # ---- High-level experiment setup ----
-    setup = "tft"  # "tft" or "two_llm"
+    # ---- High-level experiment setup from CLI ----
+    setup = args.setup  # "tft" or "two_llm"
 
-    # Shared config
-    base_model_name_p1 = "Qwen/Qwen2.5-0.5B-Instruct"
-    base_model_name_p2 = "Qwen/Qwen2.5-0.5B-Instruct"
+    base_model_name_p1 = args.model_p1
+    base_model_name_p2 = args.model_p2 or args.model_p1  # default: same as P1
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    
-    output_dir = "./runs/tft_utilitarian_with_logging"
-
+    output_dir = args.output_dir
     log_dir = os.path.join(output_dir, "logs")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -727,21 +846,20 @@ def train_grpo_stag_hunt_local():
 
     stag_cfg = StagHuntConfig(
         num_players=2,
-        num_rounds=5,
+        num_rounds=args.num_rounds,
         R_stag_stag=4.0,
         R_hare_hare=1.0,
         R_stag_hare=0.0,
         R_hare_stag=3.0,
     )
 
-    # Moral reward type:
-    #   "game", "deontological", "utilitarian", "game+deontological"
-    moral_type = "utilitarian"
+    # Moral reward type (from CLI)
+    moral_type = args.moral_type
 
-    num_updates = 30      # gradient updates
-    episodes_per_batch = 8
-    lr = 1e-5
-    max_grad_norm = 1.0
+    num_updates = args.num_updates
+    episodes_per_batch = args.episodes_per_batch
+    lr = args.lr
+    max_grad_norm = args.max_grad_norm
 
     logger.info(f"Starting GRPO Stag Hunt training, setup={setup}")
     logger.info(f"Base model P1: {base_model_name_p1}")
@@ -749,7 +867,8 @@ def train_grpo_stag_hunt_local():
     logger.info(f"StagHuntConfig: {stag_cfg}")
     logger.info(
         f"moral_type={moral_type}, num_updates={num_updates}, "
-        f"episodes_per_batch={episodes_per_batch}, lr={lr}"
+        f"episodes_per_batch={episodes_per_batch}, lr={lr}, "
+        f"temperature={args.temperature}, top_p={args.top_p}"
     )
 
     # ---- Load tokenizer (shared) ----
@@ -815,24 +934,44 @@ def train_grpo_stag_hunt_local():
             logger.info(f"=== Running update {update}/{num_updates} (LLM vs TFT) ===")
 
             # 1) Collect on-policy data
-            samples, tft_stag_rate = collect_batch_moral_vs_tft(
+            samples, tft_stag_rate, tft_rewards = collect_batch_moral_vs_tft(
                 model=model,
                 tokenizer=tokenizer,
                 config=stag_cfg,
                 device=device,
                 num_episodes=episodes_per_batch,
                 moral_type=moral_type,
-                temperature=0.7,
-                top_p=0.9,
+                temperature=args.temperature,
+                top_p=args.top_p,
                 logger=logger,
             )
 
-            rewards = torch.tensor([s.reward for s in samples], dtype=torch.float32)
-            mean_r = rewards.mean()
-            std_r = rewards.std(unbiased=False).clamp(min=1e-6)
-            advantages = (rewards - mean_r) / std_r
+            # ----- NEW: separate P1 / TFT and global stats -----
+            rewards_p1 = torch.tensor([s.reward for s in samples], dtype=torch.float32)
+            mean_r_p1 = rewards_p1.mean()
+            std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
 
-            # 2) Policy gradient update
+            # TFT (P2) reward stats for this batch
+            if len(tft_rewards) > 0:
+                rewards_p2 = torch.tensor(tft_rewards, dtype=torch.float32)
+                mean_r_p2 = rewards_p2.mean()
+                # Global stats: average over both players
+                all_rewards = torch.cat([rewards_p1, rewards_p2], dim=0)
+            else:
+                # Should basically never happen, but be robust
+                rewards_p2 = torch.tensor([0.0], dtype=torch.float32)
+                mean_r_p2 = rewards_p2.mean()
+                all_rewards = rewards_p1
+
+            mean_r_global = all_rewards.mean()
+            std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
+            # ---------------------------------------------------
+
+            # GRPO-style advantages for P1 are still computed
+            # using P1's own baseline
+            advantages = (rewards_p1 - mean_r_p1) / std_r_p1
+
+            # 2) Policy gradient update (P1 only)
             model.train()
             optimizer.zero_grad()
             total_loss = 0.0
@@ -882,34 +1021,35 @@ def train_grpo_stag_hunt_local():
 
             # === cooperation statistics ===
             p1_stag = stag_rate(samples)
-            # p2_stag = 0.0
-            # global_stag = p1_stag
             p2_stag = tft_stag_rate  # TFT opponent STAG rate
             global_stag = 0.5 * (p1_stag + p2_stag)
 
             avg_loss_p1 = total_loss / max(len(samples), 1)
             avg_loss_p2 = 0.0
 
+            # ----- NEW: log TFT reward and global reward into stats -----
             stats["update"].append(update)
-            stats["mean_reward"].append(mean_r.item())
-            stats["std_reward"].append(std_r.item())
-            stats["mean_reward_p1"].append(mean_r.item())
-            stats["mean_reward_p2"].append(0.0)
+            stats["mean_reward"].append(mean_r_global.item())        # global mean
+            stats["std_reward"].append(std_r_global.item())          # global std
+            stats["mean_reward_p1"].append(mean_r_p1.item())         # P1 mean
+            stats["mean_reward_p2"].append(mean_r_p2.item())         # TFT mean
             stats["avg_loss_p1"].append(avg_loss_p1)
             stats["avg_loss_p2"].append(avg_loss_p2)
             stats["p1_stag_rate"].append(p1_stag)
             stats["p2_stag_rate"].append(p2_stag)
             stats["global_stag_rate"].append(global_stag)
+            # ------------------------------------------------------------
 
             logger.info(
                 f"[Update {update}/{num_updates}] "
                 f"Loss P1: {avg_loss_p1:.4f} | "
-                f"Mean moral reward (P1): {mean_r.item():.3f} | "
-                f"Std reward: {std_r.item():.3f} | "
+                f"Mean moral reward (global): {mean_r_global.item():.3f} "
+                f"(P1={mean_r_p1.item():.3f}, TFT={mean_r_p2.item():.3f}) | "
+                f"Std reward (global): {std_r_global.item():.3f} | "
                 f"P1 STAG rate: {p1_stag:.3f} | "
                 f"TFT STAG rate: {p2_stag:.3f} | "
                 f"Global STAG rate: {global_stag:.3f} | "
-                f"Num samples: {len(samples)}"
+                f"Num samples (P1): {len(samples)}"
             )
 
         # Save model/tokenizer at end of TFT case
@@ -964,8 +1104,8 @@ def train_grpo_stag_hunt_local():
                 device=device,
                 num_episodes=episodes_per_batch,
                 moral_type=moral_type,
-                temperature=0.7,
-                top_p=0.9,
+                temperature=args.temperature,
+                top_p=args.top_p,
                 logger=logger,
             )
 
@@ -1222,4 +1362,5 @@ def train_grpo_stag_hunt_local():
 # ================
 
 if __name__ == "__main__":
-    train_grpo_stag_hunt_local()
+    args = parse_args()
+    train_grpo_stag_hunt_local(args)
