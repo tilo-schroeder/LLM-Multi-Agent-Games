@@ -830,8 +830,7 @@ def train_grpo_stag_hunt_local(args):
       - "tft":     Player 1 (LLM) vs fixed Tit-for-Tat opponent
       - "two_llm": Player 1 (LLM) vs Player 2 (LLM), both learning
     """
-    # ---- High-level experiment setup from CLI ----
-    setup = args.setup  # "tft" or "two_llm"
+    setup = args.setup
 
     base_model_name_p1 = args.model_p1
     base_model_name_p2 = args.model_p2 or args.model_p1  # default: same as P1
@@ -853,7 +852,6 @@ def train_grpo_stag_hunt_local(args):
         R_hare_stag=3.0,
     )
 
-    # Moral reward type (from CLI)
     moral_type = args.moral_type
 
     num_updates = args.num_updates
@@ -946,7 +944,7 @@ def train_grpo_stag_hunt_local(args):
                 logger=logger,
             )
 
-            # ----- NEW: separate P1 / TFT and global stats -----
+            # ----- separate P1 / TFT and global stats -----
             rewards_p1 = torch.tensor([s.reward for s in samples], dtype=torch.float32)
             mean_r_p1 = rewards_p1.mean()
             std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
@@ -1027,7 +1025,7 @@ def train_grpo_stag_hunt_local(args):
             avg_loss_p1 = total_loss / max(len(samples), 1)
             avg_loss_p2 = 0.0
 
-            # ----- NEW: log TFT reward and global reward into stats -----
+            # ----- log TFT reward and global reward into stats -----
             stats["update"].append(update)
             stats["mean_reward"].append(mean_r_global.item())        # global mean
             stats["std_reward"].append(std_r_global.item())          # global std
@@ -1125,7 +1123,7 @@ def train_grpo_stag_hunt_local(args):
             mean_r_global = all_rewards.mean()
             std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
 
-            # 2) Compute GRPO-style advantages *per agent*
+            # 2) Compute GRPO-style advantages per agent
             mean_r_p1 = rewards_p1.mean()
             std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
             advantages_p1 = (rewards_p1 - mean_r_p1) / std_r_p1
@@ -1178,7 +1176,7 @@ def train_grpo_stag_hunt_local(args):
             optimizer_p2.step()
             scheduler_p2.step()
 
-            # --- action stats per episode (for Figure-3-style plot) ---
+            # --- action stats per episode ---
             for ep_local in range(episodes_per_batch):
                 global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
 
@@ -1253,7 +1251,7 @@ def train_grpo_stag_hunt_local(args):
         logger.info(f"Saved fine-tuned Player 2 model to {agent2_dir}")
         logger.info(f"Saved tokenizer to {output_dir}")
 
-    # === save stats to JSON & CSV (common to both setups) ===
+    # === save stats to JSON & CSV ===
     stats_path_json = os.path.join(log_dir, "training_stats.json")
     with open(stats_path_json, "w") as f:
         json.dump(stats, f, indent=2)
@@ -1291,7 +1289,7 @@ def train_grpo_stag_hunt_local(args):
             ])
     logger.info(f"Saved training stats (CSV) to {stats_path_csv}")
 
-    # === learning curve plotting (uses whatever stats are filled) ===
+    # === learning curve plotting ===
     # 1) Global mean moral reward
     plt.figure()
     plt.plot(stats["update"], stats["mean_reward"], marker="o", label="Global mean")
