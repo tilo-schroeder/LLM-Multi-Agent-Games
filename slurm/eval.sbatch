@@ -25,11 +25,11 @@ mkdir -p "$HF_HOME"
 SETUP="tft"
 
 # For path matching
-MORAL_TYPE="deontological"
+MORAL_TYPE="utilitarian"
 
 # Directory where training saved its outputs
 # TRAIN_OUTPUT_DIR="./runs/grpo_${SETUP}_${MORAL_TYPE}"
-TRAIN_OUTPUT_DIR="./runs/tft_deontological_second_try"
+TRAIN_OUTPUT_DIR="./runs/tft_utilitarian_with_full_logging"
 
 # Pick which trained agent to evaluate on Diner's Dilemma:
 # - For SETUP="tft":      model is saved as agent_tft_p1
