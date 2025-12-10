@@ -53,9 +53,25 @@ def parse_args():
     parser.add_argument(
         "--setup",
         type=str,
-        choices=["tft", "two_llm"],
+        choices=["tft", "two_llm", "shared_llm"],
         default="tft",
-        help='Training setup: "tft" (LLM vs Tit-for-Tat) or "two_llm" (two learning LLMs).',
+        help=(
+            'Training setup: '
+            '"tft" (LLM vs fixed opponent such as Tit-for-Tat), '
+            '"two_llm" (two separate learning LLMs), or '
+            '"shared_llm" (two players share a single policy).'
+        ),
+    )
+
+    parser.add_argument(
+        "--opponent_type",
+        type=str,
+        choices=["tft", "always_cooperate", "always_defect", "random"],
+        default="tft",
+        help=(
+            'Fixed opponent strategy when setup="tft": '
+            '"tft", "always_cooperate", "always_defect", or "random".'
+        ),
     )
 
     # Models
@@ -141,7 +157,7 @@ def parse_args():
 
 
 # =======================================
-# Fixed opponent: Tit-for-Tat (kept)
+# Fixed opponents
 # =======================================
 
 class TitForTatOpponent:
@@ -163,6 +179,54 @@ class TitForTatOpponent:
         last_a1, _ = history[-1]
         # Copy last action of Player 1
         return last_a1
+
+class AlwaysCooperateOpponent:
+    """Always play STAG (cooperate)."""
+
+    def reset(self):
+        pass
+
+    def act(self, env_obs: Dict[str, Any]) -> str:
+        return StagHuntEnv.ACTION_STAG
+
+
+class AlwaysDefectOpponent:
+    """Always play HARE (defect)."""
+
+    def reset(self):
+        pass
+
+    def act(self, env_obs: Dict[str, Any]) -> str:
+        return StagHuntEnv.ACTION_HARE
+
+
+class RandomOpponent:
+    """Play STAG/HARE uniformly at random."""
+
+    def reset(self):
+        pass
+
+    def act(self, env_obs: Dict[str, Any]) -> str:
+        return np.random.choice(
+            [StagHuntEnv.ACTION_STAG, StagHuntEnv.ACTION_HARE]
+        )
+
+
+def make_fixed_opponent(opponent_type: str):
+    """
+    Factory for fixed opponents.
+
+    opponent_type in {"tft", "always_cooperate", "always_defect", "random"}.
+    """
+    if opponent_type == "tft":
+        return TitForTatOpponent()
+    if opponent_type == "always_cooperate":
+        return AlwaysCooperateOpponent()
+    if opponent_type == "always_defect":
+        return AlwaysDefectOpponent()
+    if opponent_type == "random":
+        return RandomOpponent()
+    raise ValueError(f"Unknown opponent_type: {opponent_type}")
 
 
 # =======================================
@@ -498,28 +562,32 @@ def collect_batch_moral_vs_tft(
     temperature: float = 0.7,
     top_p: float = 0.9,
     logger: logging.Logger = None,
+    opponent_type: str = "tft",
 ) -> Tuple[List[DecisionSample], float, List[float]]:
     """
-    Collect num_episodes of (LLM vs Tit-for-Tat).
+    Collect num_episodes of (LLM vs fixed opponent).
 
     Returns:
         all_samples: DecisionSample list for P1
-        tft_stag_rate: overall STAG rate of TFT in this batch
-        tft_rewards: list of TFT moral rewards for all env steps in batch
+        opp_stag_rate: overall STAG rate of the opponent in this batch
+        opp_rewards: list of opponent moral rewards for all env steps in batch
     """
     if logger is None:
         logger = get_logger()
 
     all_samples: List[DecisionSample] = []
-    opponent = TitForTatOpponent()
+    opponent = make_fixed_opponent(opponent_type)
 
     total_p2_stags = 0
     total_p2_actions = 0
-    tft_rewards_batch: List[float] = []
+    opp_rewards_batch: List[float] = []
 
     for ep_id in range(num_episodes):
-        logger.info(f"  Rolling out moral episode {ep_id} (type={moral_type}) vs TFT...")
-        samples, total_moral_p1, tft_rewards_ep, p2_stags, p2_actions = rollout_episode_vs_tft(
+        logger.info(
+            f"  Rolling out moral episode {ep_id} "
+            f"(type={moral_type}) vs fixed opponent '{opponent_type}'..."
+        )
+        samples, total_moral_p1, opp_rewards_ep, p2_stags, p2_actions = rollout_episode_vs_tft(
             model=model,
             tokenizer=tokenizer,
             config=config,
@@ -531,7 +599,7 @@ def collect_batch_moral_vs_tft(
             top_p=top_p,
         )
         all_samples.extend(samples)
-        tft_rewards_batch.extend(tft_rewards_ep)
+        opp_rewards_batch.extend(opp_rewards_ep)
 
         total_p2_stags += p2_stags
         total_p2_actions += p2_actions
@@ -547,13 +615,13 @@ def collect_batch_moral_vs_tft(
             for triple in rounds:
                 logger.info(f"      {triple}")
 
-            tft_ep_rate = (p2_stags / p2_actions) if p2_actions > 0 else 0.0
-            tft_ep_mean = (sum(tft_rewards_ep) / len(tft_rewards_ep)) if tft_rewards_ep else 0.0
-            logger.info(f"    TFT STAG rate (episode {ep_id})={tft_ep_rate:.3f}")
-            logger.info(f"    TFT mean moral reward (episode {ep_id})={tft_ep_mean:.3f}")
+            opp_ep_rate = (p2_stags / p2_actions) if p2_actions > 0 else 0.0
+            opp_ep_mean = (sum(opp_rewards_ep) / len(opp_rewards_ep)) if opp_rewards_ep else 0.0
+            logger.info(f"    Opponent STAG rate (episode {ep_id})={opp_ep_rate:.3f}")
+            logger.info(f"    Opponent mean moral reward (episode {ep_id})={opp_ep_mean:.3f}")
 
-    tft_stag_rate = (total_p2_stags / total_p2_actions) if total_p2_actions > 0 else 0.0
-    return all_samples, tft_stag_rate, tft_rewards_batch
+    opp_stag_rate = (total_p2_stags / total_p2_actions) if total_p2_actions > 0 else 0.0
+    return all_samples, opp_stag_rate, opp_rewards_batch
 
 
 # ===== Moral self-play with TWO separate learning agents =====
@@ -754,6 +822,200 @@ def collect_batch_moral_two_llm_agents(
     return all_samples
 
 
+# ===== Moral self-play with SHARED policy (one model for both players) =====
+
+def rollout_episode_shared_policy(
+    model,
+    tokenizer,
+    config: StagHuntConfig,
+    device: torch.device,
+    episode_id: int,
+    moral_type: str,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    xi: float = 3.0,
+    illegal_penalty: float = -6.0,
+) -> Tuple[List[DecisionSample], float, float]:
+    """
+    Self-play rollout: a single LLM policy controls both Player 1 and Player 2.
+    Both receive moral, per-decision rewards.
+    """
+    env = StagHuntEnv(config)
+    obs = env.reset(random_initial_state=True)
+
+    samples: List[DecisionSample] = []
+    rewards_p1: List[float] = []
+    rewards_p2: List[float] = []
+
+    for t in range(config.num_rounds):
+        round_idx = t + 1
+        history = obs["history"]
+
+        prev_a1, prev_a2 = (None, None)
+        if history:
+            prev_a1, prev_a2 = history[-1]
+
+        # ---- Player 1 decision ----
+        prompt1 = build_decision_prompt(1, obs, config, tokenizer)
+        completion1 = generate_completion(
+            model, tokenizer, prompt1, device,
+            temperature=temperature, top_p=top_p,
+        )
+        a1, legal1 = extract_action_from_completion(completion1)
+        sample1 = DecisionSample(
+            episode_id=episode_id,
+            player_id=1,
+            round_idx=round_idx,
+            prompt=prompt1,
+            completion=completion1,
+            reward=0.0,
+            action=a1,
+            opp_prev_action=prev_a2 or "",
+            is_legal=legal1,
+        )
+
+        # ---- Player 2 decision ----
+        prompt2 = build_decision_prompt(2, obs, config, tokenizer)
+        completion2 = generate_completion(
+            model, tokenizer, prompt2, device,
+            temperature=temperature, top_p=top_p,
+        )
+        a2, legal2 = extract_action_from_completion(completion2)
+        sample2 = DecisionSample(
+            episode_id=episode_id,
+            player_id=2,
+            round_idx=round_idx,
+            prompt=prompt2,
+            completion=completion2,
+            reward=0.0,
+            action=a2,
+            opp_prev_action=prev_a1 or "",
+            is_legal=legal2,
+        )
+
+        # If either player is illegal, do not advance env; just give penalties
+        if not legal1 or not legal2:
+            r1 = r2 = 0.0
+
+            moral_r1 = compute_moral_reward_stag_hunt(
+                moral_type=moral_type,
+                agent_action=a1 if legal1 else StagHuntEnv.ACTION_HARE,
+                opp_prev_action=prev_a2,
+                r_agent=r1,
+                r_opp=r2,
+                is_legal=legal1,
+                xi=xi,
+                illegal_penalty=illegal_penalty,
+            )
+            moral_r2 = compute_moral_reward_stag_hunt(
+                moral_type=moral_type,
+                agent_action=a2 if legal2 else StagHuntEnv.ACTION_HARE,
+                opp_prev_action=prev_a1,
+                r_agent=r2,
+                r_opp=r1,
+                is_legal=legal2,
+                xi=xi,
+                illegal_penalty=illegal_penalty,
+            )
+
+            sample1.reward = moral_r1
+            sample2.reward = moral_r2
+
+            rewards_p1.append(moral_r1)
+            rewards_p2.append(moral_r2)
+            samples.extend([sample1, sample2])
+            continue
+
+        # ---- Both legal → env step ----
+        obs, (r1, r2), done, info = env.step(a1, a2)
+
+        moral_r1 = compute_moral_reward_stag_hunt(
+            moral_type=moral_type,
+            agent_action=a1,
+            opp_prev_action=prev_a2,
+            r_agent=r1,
+            r_opp=r2,
+            is_legal=True,
+            xi=xi,
+            illegal_penalty=illegal_penalty,
+        )
+        moral_r2 = compute_moral_reward_stag_hunt(
+            moral_type=moral_type,
+            agent_action=a2,
+            opp_prev_action=prev_a1,
+            r_agent=r2,
+            r_opp=r1,
+            is_legal=True,
+            xi=xi,
+            illegal_penalty=illegal_penalty,
+        )
+
+        sample1.reward = moral_r1
+        sample2.reward = moral_r2
+
+        rewards_p1.append(moral_r1)
+        rewards_p2.append(moral_r2)
+        samples.extend([sample1, sample2])
+
+    total_moral_p1 = float(sum(rewards_p1))
+    total_moral_p2 = float(sum(rewards_p2))
+
+    return samples, total_moral_p1, total_moral_p2
+
+
+def collect_batch_moral_shared_policy(
+    model,
+    tokenizer,
+    config: StagHuntConfig,
+    device: torch.device,
+    num_episodes: int,
+    moral_type: str,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    logger: logging.Logger = None,
+) -> List[DecisionSample]:
+    """
+    Collect num_episodes of self-play with a single shared policy
+    controlling both players.
+    """
+    if logger is None:
+        logger = get_logger()
+
+    all_samples: List[DecisionSample] = []
+
+    for ep_id in range(num_episodes):
+        logger.info(
+            f"  Rolling out shared-policy moral episode {ep_id} (type={moral_type})..."
+        )
+        samples, total_moral_p1, total_moral_p2 = rollout_episode_shared_policy(
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            device=device,
+            episode_id=ep_id,
+            moral_type=moral_type,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        all_samples.extend(samples)
+
+        if ep_id < 2:
+            logger.info(
+                f"    Episode {ep_id} total moral returns: "
+                f"P1={total_moral_p1:.3f}, P2={total_moral_p2:.3f}"
+            )
+            rounds = [
+                (s.round_idx, s.player_id,
+                 extract_action_from_completion(s.completion)[0])
+                for s in samples
+            ]
+            logger.info("    Parsed actions (round, player, action):")
+            for triple in rounds:
+                logger.info(f"      {triple}")
+
+    return all_samples
+
+
 # ===========================
 # 5. GRPO-style RL training
 # ===========================
@@ -831,6 +1093,7 @@ def train_grpo_stag_hunt_local(args):
       - "two_llm": Player 1 (LLM) vs Player 2 (LLM), both learning
     """
     setup = args.setup
+    opponent_type = args.opponent_type # (used when setup == "tft")
 
     base_model_name_p1 = args.model_p1
     base_model_name_p2 = args.model_p2 or args.model_p1  # default: same as P1
@@ -862,6 +1125,7 @@ def train_grpo_stag_hunt_local(args):
     logger.info(f"Starting GRPO Stag Hunt training, setup={setup}")
     logger.info(f"Base model P1: {base_model_name_p1}")
     logger.info(f"Base model P2: {base_model_name_p2}")
+    opponent_type = args.opponent_type  # NEW (used when setup == "tft")
     logger.info(f"StagHuntConfig: {stag_cfg}")
     logger.info(
         f"moral_type={moral_type}, num_updates={num_updates}, "
@@ -910,7 +1174,7 @@ def train_grpo_stag_hunt_local(args):
         return stags / len(decisions)
 
     # =========================
-    # Case 1: LLM vs Tit-for-Tat
+    # Case 1: LLM vs fixed opponent
     # =========================
     if setup == "tft":
         model = AutoModelForCausalLM.from_pretrained(
@@ -929,10 +1193,13 @@ def train_grpo_stag_hunt_local(args):
         )
 
         for update in range(1, num_updates + 1):
-            logger.info(f"=== Running update {update}/{num_updates} (LLM vs TFT) ===")
+            logger.info(
+                f"=== Running update {update}/{num_updates} "
+                f"(LLM vs fixed opponent='{opponent_type}') ==="
+            )
 
             # 1) Collect on-policy data
-            samples, tft_stag_rate, tft_rewards = collect_batch_moral_vs_tft(
+            samples, opp_stag_rate, opp_rewards = collect_batch_moral_vs_tft(
                 model=model,
                 tokenizer=tokenizer,
                 config=stag_cfg,
@@ -942,31 +1209,27 @@ def train_grpo_stag_hunt_local(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logger=logger,
+                opponent_type=opponent_type,   # NEW
             )
 
-            # ----- separate P1 / TFT and global stats -----
+            # ----- separate P1 / opponent and global stats -----
             rewards_p1 = torch.tensor([s.reward for s in samples], dtype=torch.float32)
             mean_r_p1 = rewards_p1.mean()
             std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
 
-            # TFT (P2) reward stats for this batch
-            if len(tft_rewards) > 0:
-                rewards_p2 = torch.tensor(tft_rewards, dtype=torch.float32)
+            # Opponent reward stats for this batch
+            if len(opp_rewards) > 0:
+                rewards_p2 = torch.tensor(opp_rewards, dtype=torch.float32)
                 mean_r_p2 = rewards_p2.mean()
-                # Global stats: average over both players
                 all_rewards = torch.cat([rewards_p1, rewards_p2], dim=0)
             else:
-                # Should basically never happen, but be robust
                 rewards_p2 = torch.tensor([0.0], dtype=torch.float32)
                 mean_r_p2 = rewards_p2.mean()
                 all_rewards = rewards_p1
 
             mean_r_global = all_rewards.mean()
             std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
-            # ---------------------------------------------------
 
-            # GRPO-style advantages for P1 are still computed
-            # using P1's own baseline
             advantages = (rewards_p1 - mean_r_p1) / std_r_p1
 
             # 2) Policy gradient update (P1 only)
@@ -1019,46 +1282,44 @@ def train_grpo_stag_hunt_local(args):
 
             # === cooperation statistics ===
             p1_stag = stag_rate(samples)
-            p2_stag = tft_stag_rate  # TFT opponent STAG rate
+            p2_stag = opp_stag_rate  # fixed opponent STAG rate
             global_stag = 0.5 * (p1_stag + p2_stag)
 
             avg_loss_p1 = total_loss / max(len(samples), 1)
             avg_loss_p2 = 0.0
 
-            # ----- log TFT reward and global reward into stats -----
             stats["update"].append(update)
-            stats["mean_reward"].append(mean_r_global.item())        # global mean
-            stats["std_reward"].append(std_r_global.item())          # global std
-            stats["mean_reward_p1"].append(mean_r_p1.item())         # P1 mean
-            stats["mean_reward_p2"].append(mean_r_p2.item())         # TFT mean
+            stats["mean_reward"].append(mean_r_global.item())
+            stats["std_reward"].append(std_r_global.item())
+            stats["mean_reward_p1"].append(mean_r_p1.item())
+            stats["mean_reward_p2"].append(mean_r_p2.item())
             stats["avg_loss_p1"].append(avg_loss_p1)
             stats["avg_loss_p2"].append(avg_loss_p2)
             stats["p1_stag_rate"].append(p1_stag)
             stats["p2_stag_rate"].append(p2_stag)
             stats["global_stag_rate"].append(global_stag)
-            # ------------------------------------------------------------
 
             logger.info(
                 f"[Update {update}/{num_updates}] "
                 f"Loss P1: {avg_loss_p1:.4f} | "
                 f"Mean moral reward (global): {mean_r_global.item():.3f} "
-                f"(P1={mean_r_p1.item():.3f}, TFT={mean_r_p2.item():.3f}) | "
+                f"(P1={mean_r_p1.item():.3f}, Opp={mean_r_p2.item():.3f}) | "
                 f"Std reward (global): {std_r_global.item():.3f} | "
                 f"P1 STAG rate: {p1_stag:.3f} | "
-                f"TFT STAG rate: {p2_stag:.3f} | "
+                f"Opponent STAG rate: {p2_stag:.3f} | "
                 f"Global STAG rate: {global_stag:.3f} | "
                 f"Num samples (P1): {len(samples)}"
             )
 
-        # Save model/tokenizer at end of TFT case
-        model.save_pretrained(os.path.join(output_dir, "agent_tft_p1"))
+        # Save model/tokenizer at end of fixed-opponent case
+        model.save_pretrained(os.path.join(output_dir, "agent_fixed_opp_p1"))
         tokenizer.save_pretrained(output_dir)
-        logger.info(f"Saved fine-tuned Player 1 model (vs TFT) to {output_dir}")
+        logger.info(f"Saved fine-tuned Player 1 model (vs fixed opponent) to {output_dir}")
 
     # =========================
     # Case 2: Two learning LLM agents
     # =========================
-    else:
+    elif setup == "two_llm":
         model_p1 = AutoModelForCausalLM.from_pretrained(
             base_model_name_p1,
             trust_remote_code=True,
@@ -1250,6 +1511,163 @@ def train_grpo_stag_hunt_local(args):
         logger.info(f"Saved fine-tuned Player 1 model to {agent1_dir}")
         logger.info(f"Saved fine-tuned Player 2 model to {agent2_dir}")
         logger.info(f"Saved tokenizer to {output_dir}")
+
+        # =========================
+    # Case 3: Two LLM agents with SHARED policy
+    # =========================
+    elif setup == "shared_llm":
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name_p1,
+            trust_remote_code=True,
+        ).to(device)
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.train()
+
+        optimizer = AdamW(model.parameters(), lr=lr)
+        total_steps = num_updates
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),
+            num_training_steps=total_steps,
+        )
+
+        for update in range(1, num_updates + 1):
+            logger.info(
+                f"=== Running update {update}/{num_updates} "
+                f"(two LLM roles, shared policy) ==="
+            )
+
+            # 1) Collect data under current shared policy
+            samples = collect_batch_moral_shared_policy(
+                model=model,
+                tokenizer=tokenizer,
+                config=stag_cfg,
+                device=device,
+                num_episodes=episodes_per_batch,
+                moral_type=moral_type,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                logger=logger,
+            )
+
+            samples_p1 = [s for s in samples if s.player_id == 1]
+            samples_p2 = [s for s in samples if s.player_id == 2]
+
+            if not samples_p1 or not samples_p2:
+                logger.warning(
+                    "One of the players has no samples in this batch (shared policy). "
+                    "Skipping update."
+                )
+                continue
+
+            rewards_p1 = torch.tensor([s.reward for s in samples_p1], dtype=torch.float32)
+            rewards_p2 = torch.tensor([s.reward for s in samples_p2], dtype=torch.float32)
+
+            all_samples = samples_p1 + samples_p2
+            rewards_all = torch.tensor(
+                [s.reward for s in all_samples],
+                dtype=torch.float32,
+            )
+
+            mean_r_global = rewards_all.mean()
+            std_r_global = rewards_all.std(unbiased=False).clamp(min=1e-6)
+
+            mean_r_p1 = rewards_p1.mean()
+            mean_r_p2 = rewards_p2.mean()
+
+            advantages_all = (rewards_all - mean_r_global) / std_r_global
+
+            # 2) Policy gradient update (shared policy)
+            model.train()
+            optimizer.zero_grad()
+            total_loss = 0.0
+
+            for s, adv in zip(all_samples, advantages_all):
+                adv_i = adv.to(device)
+                logprob_i = compute_logprob_for_sample(
+                    model=model,
+                    tokenizer=tokenizer,
+                    sample=s,
+                    device=device,
+                    max_length=512,
+                )
+                loss_i = -adv_i * logprob_i
+                loss_i.backward()
+                total_loss += loss_i.item()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+
+            # --- action stats per episode (both players) ---
+            for ep_local in range(episodes_per_batch):
+                global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
+
+                counts = {cat: 0 for cat in action_categories}
+                for s in samples:
+                    if s.episode_id != ep_local:
+                        continue
+
+                    if s.opp_prev_action not in (
+                        StagHuntEnv.ACTION_STAG,
+                        StagHuntEnv.ACTION_HARE,
+                    ):
+                        continue
+
+                    opp = s.opp_prev_action
+                    if not s.is_legal:
+                        key = f"illegal|{opp}"
+                    else:
+                        act = s.action or extract_action_from_completion(s.completion)[0]
+                        key = f"{act}|{opp}"
+                    if key in counts:
+                        counts[key] += 1
+
+                action_stats["episode"].append(global_ep_idx)
+                for cat in action_categories:
+                    action_stats[cat].append(counts[cat])
+
+            # === cooperation statistics ===
+            p1_stag = stag_rate(samples_p1)
+            p2_stag = stag_rate(samples_p2)
+            global_stag = 0.5 * (p1_stag + p2_stag)
+
+            avg_loss = total_loss / max(len(all_samples), 1)
+            avg_loss_p1 = avg_loss
+            avg_loss_p2 = avg_loss  # same model
+
+            stats["update"].append(update)
+            stats["mean_reward"].append(mean_r_global.item())
+            stats["std_reward"].append(std_r_global.item())
+            stats["mean_reward_p1"].append(mean_r_p1.item())
+            stats["mean_reward_p2"].append(mean_r_p2.item())
+            stats["avg_loss_p1"].append(avg_loss_p1)
+            stats["avg_loss_p2"].append(avg_loss_p2)
+            stats["p1_stag_rate"].append(p1_stag)
+            stats["p2_stag_rate"].append(p2_stag)
+            stats["global_stag_rate"].append(global_stag)
+
+            logger.info(
+                f"[Update {update}/{num_updates}] "
+                f"Shared policy loss: {avg_loss:.4f} | "
+                f"Mean moral reward (global): {mean_r_global.item():.3f} "
+                f"(P1={mean_r_p1.item():.3f}, P2={mean_r_p2.item():.3f}) | "
+                f"Std reward (global): {std_r_global.item():.3f} | "
+                f"P1 STAG rate: {p1_stag:.3f} | "
+                f"P2 STAG rate: {p2_stag:.3f} | "
+                f"Global STAG rate: {global_stag:.3f} | "
+                f"Num samples (both players): {len(all_samples)}"
+            )
+
+        # Save shared-policy model
+        shared_dir = os.path.join(output_dir, "shared_policy")
+        os.makedirs(shared_dir, exist_ok=True)
+        model.save_pretrained(shared_dir)
+        tokenizer.save_pretrained(output_dir)
+        logger.info(f"Saved fine-tuned shared policy model to {shared_dir}")
+
+    else:
+        raise ValueError(f"Unknown setup: {setup}")
 
     # === save stats to JSON & CSV ===
     stats_path_json = os.path.join(log_dir, "training_stats.json")

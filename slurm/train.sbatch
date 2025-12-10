@@ -20,12 +20,19 @@ mkdir -p logs
 export HF_HOME="${HF_HOME:-$SCRATCH/hf-cache}"
 mkdir -p "$HF_HOME"
 
-# === Experiment configuration (edit as needed) ===
+# === Experiment configuration ===
 
-# Which setup: "tft" (LLM vs Tit-for-Tat) or "two_llm" (two learning agents)
+# Which setup:
+#   "tft"        -> LLM vs fixed opponent (e.g. Tit-for-Tat, always defect, random)
+#   "two_llm"    -> two separate learning LLMs (P1 and P2)
+#   "shared_llm" -> two players controlled by a single shared policy
 SETUP="tft"
 
-# Models
+# Fixed opponent strategy when SETUP="tft":
+#   "tft", "always_cooperate", "always_defect", "random"
+OPPONENT_TYPE="always_cooperate"
+
+# Models (model 2 defaults to model 1 if empty; unused for shared_llm)
 MODEL_P1="Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_P2=""
 
@@ -43,13 +50,18 @@ EPISODES_PER_BATCH=8
 NUM_ROUNDS=5
 MAX_GRAD_NORM=1.0
 
-# Output directory (will also contain logs from your trainer)
-OUTPUT_DIR="./runs/grpo_${SETUP}_${MORAL_TYPE}"
+# Output dir
+if [[ "$SETUP" == "tft" ]]; then
+  OUTPUT_DIR="./runs/grpo_${SETUP}_${OPPONENT_TYPE}_${MORAL_TYPE}"
+else
+  OUTPUT_DIR="./runs/grpo_${SETUP}_${MORAL_TYPE}"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 
 echo "Running training with:"
 echo "  setup=${SETUP}"
+echo "  opponent_type=${OPPONENT_TYPE}"
 echo "  model_p1=${MODEL_P1}"
 echo "  model_p2=${MODEL_P2:-<same as p1>}"
 echo "  moral_type=${MORAL_TYPE}"
@@ -61,6 +73,7 @@ echo "  output_dir=${OUTPUT_DIR}"
 # === Launch Python ===
 python -m training.experiment \
   --setup "${SETUP}" \
+  --opponent_type "${OPPONENT_TYPE}" \
   --model_p1 "${MODEL_P1}" \
   $( [[ -n "$MODEL_P2" ]] && echo --model_p2 "${MODEL_P2}" ) \
   --moral_type "${MORAL_TYPE}" \
