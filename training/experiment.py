@@ -356,24 +356,29 @@ Reply now with exactly one line.
     return prompt
 
 
+# Very restrictive parsing (any non perfect match is illegal)
 def extract_action_from_completion(text: str) -> Tuple[str, bool]:
     """
-    Given a completion that ends with something like "ACTION: STAG",
-    parse and return (action, is_legal) where action is "STAG" or "HARE".
-
-    If parsing fails, default to HARE and mark as illegal.
+    Very strict: only accept if the completion is exactly one line
+    with format "ACTION: STAG" or "ACTION: HARE"
     """
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for line in reversed(lines):  # search from the end
-        if line.upper().startswith("ACTION:"):
-            tail = line.split(":", 1)[1].strip().upper()
-            if "STAG" in tail:
-                return StagHuntEnv.ACTION_STAG, True
-            if "HARE" in tail:
-                return StagHuntEnv.ACTION_HARE, True
-    # Fallback: default to HARE (safe action) if parsing fails
-    return StagHuntEnv.ACTION_HARE, False
-
+    text = text.strip()
+    
+    # Check if it's a single line
+    if '\n' in text:
+        return StagHuntEnv.ACTION_HARE, False
+    
+    if not text.upper().startswith("ACTION:"):
+        return StagHuntEnv.ACTION_HARE, False
+    
+    tail = text.split(":", 1)[1].strip().upper()
+    
+    if tail == "STAG":
+        return StagHuntEnv.ACTION_STAG, True
+    elif tail == "HARE":
+        return StagHuntEnv.ACTION_HARE, True
+    else:
+        return StagHuntEnv.ACTION_HARE, False
 
 # ==================================
 # 4. Episode rollout & data logging
@@ -393,6 +398,46 @@ class DecisionSample:
     is_legal: bool = True
 
 
+def log_completions(
+    samples: List[DecisionSample],
+    log_file: str,
+    meta: Dict[str, Any],
+) -> None:
+    """
+    Append used completions to a JSONL file.
+
+    Only logs:
+      - metadata (setup, update, moral_type, etc.)
+      - episode / player / round
+      - completion text
+      - parsed action, reward, legality
+
+    Does NOT log the full prompt.
+    """
+    if not samples:
+        return
+
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        for s in samples:
+            row = {
+                "setup": meta.get("setup"),
+                "update": meta.get("update"),
+                "moral_type": meta.get("moral_type"),
+                "opponent_type": meta.get("opponent_type"),
+                "episode_id": s.episode_id,
+                "player_id": s.player_id,
+                "round_idx": s.round_idx,
+                "completion": s.completion,
+                "action": s.action,
+                "opp_prev_action": s.opp_prev_action,
+                "reward": s.reward,
+                "is_legal": s.is_legal,
+            }
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def generate_completion(
     model,
     tokenizer,
@@ -402,10 +447,16 @@ def generate_completion(
     temperature: float = 0.7,
     top_p: float = 0.9,
 ) -> str:
-    """Generate a single completion for a local decision prompt."""
+    """Generate a single completion for a local decision prompt.
+
+    Returns ONLY the model's continuation (no prompt, no roles),
+    decoded from the newly generated tokens.
+    """
     model.eval()
     with torch.no_grad():
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        input_ids = inputs["input_ids"]
+
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -414,12 +465,16 @@ def generate_completion(
             top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
         )
-        full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    if full_text.startswith(prompt):
-        completion = full_text[len(prompt):]
-    else:
-        completion = full_text
+        # Take only the newly generated tokens
+        gen_ids = output_ids[0, input_ids.shape[1]:]
+
+        if gen_ids.numel() == 0:
+            # Model generated nothing new; treat as empty completion
+            return ""
+
+        completion = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
     return completion
 
 
@@ -1106,6 +1161,10 @@ def train_grpo_stag_hunt_local(args):
 
     logger = get_logger(log_dir)
 
+    completion_log_path = os.path.join(log_dir, "completions.jsonl")
+    if os.path.exists(completion_log_path):
+        os.remove(completion_log_path)
+
     stag_cfg = StagHuntConfig(
         num_players=2,
         num_rounds=args.num_rounds,
@@ -1209,13 +1268,31 @@ def train_grpo_stag_hunt_local(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logger=logger,
-                opponent_type=opponent_type,   # NEW
+                opponent_type=opponent_type,
+            )
+
+            log_completions(
+                samples,
+                completion_log_path,
+                meta={
+                    "setup": setup,
+                    "update": update,
+                    "moral_type": moral_type,
+                    "opponent_type": opponent_type,
+                },
             )
 
             # ----- separate P1 / opponent and global stats -----
             rewards_p1 = torch.tensor([s.reward for s in samples], dtype=torch.float32)
             mean_r_p1 = rewards_p1.mean()
             std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
+
+            # std_r_p1 = rewards_p1.std(unbiased=False)
+            # if std_r_p1 < 1e-6:
+            #     logger.warning("Reward variance ~0; skipping update to avoid zero-advantage collapse.")
+            #     continue
+
+            # std_r_p1 = std_r_p1.clamp(min=1e-6)
 
             # Opponent reward stats for this batch
             if len(opp_rewards) > 0:
@@ -1366,6 +1443,17 @@ def train_grpo_stag_hunt_local(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logger=logger,
+            )
+
+            log_completions(
+                samples,
+                completion_log_path,
+                meta={
+                    "setup": setup,
+                    "update": update,
+                    "moral_type": moral_type,
+                    "opponent_type": None,
+                },
             )
 
             # Separate samples by player
@@ -1548,6 +1636,17 @@ def train_grpo_stag_hunt_local(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logger=logger,
+            )
+
+            log_completions(
+                samples,
+                completion_log_path,
+                meta={
+                    "setup": setup,
+                    "update": update,
+                    "moral_type": moral_type,
+                    "opponent_type": None,
+                },
             )
 
             samples_p1 = [s for s in samples if s.player_id == 1]
