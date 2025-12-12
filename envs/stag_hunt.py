@@ -1,104 +1,151 @@
-import random
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from __future__ import annotations
 
-# =========================
-# 1. Stag Hunt Environment
-# =========================
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+import numpy as np
+
+
+# ============================================================================
+# N-Player Stag Hunt Environment (true joint action payoffs)
+# ============================================================================
 
 @dataclass
 class StagHuntConfig:
+    """Configuration for the N-player Stag Hunt environment."""
     num_players: int = 2
-    num_rounds: int = 5
-    R_stag_stag: float = 4.0
-    R_hare_hare: float = 1.0
-    R_stag_hare: float = 0.0
-    R_hare_stag: float = 3.0
+    max_steps: int = 1
+
+    # Environment actions (internal semantics)
+    action_names: Tuple[str, str] = ("stag", "hare")
+
+    # LLM-visible "legal" action tokens (stabilizes parsing & PPO)
+    action_tokens: Tuple[str, str] = ("action1", "action2")
+
+    # Threshold Stag Hunt:
+    threshold: int = 2
+    stag_success_reward: float = 4.0
+    stag_fail_reward: float = 0.0
+    hare_reward: float = 2.0
+
+    def token_to_action(self, tok: str) -> str:
+        """Map LLM token -> env action."""
+        if tok == self.action_tokens[0]:
+            return self.action_names[0]  # action1 -> stag
+        if tok == self.action_tokens[1]:
+            return self.action_names[1]  # action2 -> hare
+        return self.action_names[1]
 
 
 class StagHuntEnv:
-    """Simple 2-player repeated Stag Hunt."""
+    """
+    True N-player Stag Hunt. Payoffs computed from the joint action profile.
+    history is List[List[str]] of joint action vectors (length num_players).
+    """
 
-    ACTION_STAG = "STAG"
-    ACTION_HARE = "HARE"
+    def __init__(self, config: Optional[StagHuntConfig] = None):
+        self.config = config or StagHuntConfig()
+        self.history: List[List[str]] = []
+        self.step_count = 0
 
-    def __init__(self, config: StagHuntConfig):
-        assert config.num_players == 2, "This env is implemented for 2 players."
-        self.config = config
-        self.initial_state: Tuple[str, str] | None = None
-        self.reset()
+    def reset(self, random_initial_state: bool = True) -> Dict[str, Any]:
+        self.history = []
+        self.step_count = 0
 
-    def reset(self, random_initial_state: bool = False):
-        self.round = 0
-        # history: list of tuples (a1, a2) for *real* past rounds
-        self.history: List[Tuple[str, str]] = []
-        self.initial_state = None
-
+        # Random previous move initialization
         if random_initial_state:
-            # Random “previous joint action” for the state, as in the paper
-            a1 = random.choice([self.ACTION_STAG, self.ACTION_HARE])
-            a2 = random.choice([self.ACTION_STAG, self.ACTION_HARE])
-            self.initial_state = (a1, a2)
+            acts = list(self.config.action_names)
+            prev = [str(np.random.choice(acts)) for _ in range(self.config.num_players)]
+            self.history.append(prev)
 
-        return self._get_obs()
+        return {"history": [h.copy() for h in self.history]}
 
-    def _get_obs(self) -> Dict[str, Any]:
-        # Observation history = optional initial_state + real rounds
-        full_history: List[Tuple[str, str]] = []
-        if self.initial_state is not None:
-            full_history.append(self.initial_state)
-        full_history.extend(self.history)
+    def step(self, actions: List[str]) -> Tuple[Dict[str, Any], List[float], bool, Dict]:
+        cfg = self.config
+        assert len(actions) == cfg.num_players
 
-        return {
-            "round": self.round,          # number of *real* rounds played so far
-            "history": full_history,      # what the agent sees as “previous moves”
-        }
+        k = sum(1 for a in actions if a == cfg.action_names[0])  # #stag
+        success = (k >= cfg.threshold)
 
-    def step(self, action_p1: str, action_p2: str):
-        assert action_p1 in (self.ACTION_STAG, self.ACTION_HARE)
-        assert action_p2 in (self.ACTION_STAG, self.ACTION_HARE)
+        payoffs: List[float] = []
+        for a in actions:
+            if a == cfg.action_names[1]:  # hare
+                payoffs.append(cfg.hare_reward)
+            else:  # stag
+                payoffs.append(cfg.stag_success_reward if success else cfg.stag_fail_reward)
 
-        # Only *legal* moves call step; illegal moves should never get here
-        self.history.append((action_p1, action_p2))
-        self.round += 1
+        self.history.append(list(actions))
+        self.step_count += 1
+        done = self.step_count >= cfg.max_steps
+        return {"history": [h.copy() for h in self.history]}, payoffs, done, {}
 
-        c = self.config
-        if action_p1 == self.ACTION_STAG and action_p2 == self.ACTION_STAG:
-            r1 = c.R_stag_stag
-            r2 = c.R_stag_stag
-        elif action_p1 == self.ACTION_HARE and action_p2 == self.ACTION_HARE:
-            r1 = c.R_hare_hare
-            r2 = c.R_hare_hare
-        elif action_p1 == self.ACTION_STAG and action_p2 == self.ACTION_HARE:
-            r1 = c.R_stag_hare
-            r2 = c.R_hare_stag
-        else:  # action_p1 == HARE, action_p2 == STAG
-            r1 = c.R_hare_stag
-            r2 = c.R_stag_hare
+    def step_with_legality(
+        self,
+        actions: List[str],
+        legal: List[bool],
+    ) -> Tuple[Dict[str, Any], List[float], bool, Dict]:
+        """
+        If a player is illegal, do NOT let their action update the public state.
+        We freeze their action to the previous state's action for state update/payoff calc.
 
-        done = self.round >= c.num_rounds
-        obs = self._get_obs()
-        info = {}
-        return obs, (r1, r2), done, info
+        (The illegal player still receives illegal penalty in your reward function.)
+        """
+        cfg = self.config
+        assert len(actions) == cfg.num_players
+        assert len(legal) == cfg.num_players
 
-    def compute_episode_returns(self) -> Tuple[float, float]:
-        """Recompute total returns for each player from history."""
-        c = self.config
-        total_r1 = 0.0
-        total_r2 = 0.0
-        for a1, a2 in self.history:
-            if a1 == self.ACTION_STAG and a2 == self.ACTION_STAG:
-                r1 = c.R_stag_stag
-                r2 = c.R_stag_stag
-            elif a1 == self.ACTION_HARE and a2 == self.ACTION_HARE:
-                r1 = c.R_hare_hare
-                r2 = c.R_hare_hare
-            elif a1 == self.ACTION_STAG and a2 == self.ACTION_HARE:
-                r1 = c.R_stag_hare
-                r2 = c.R_hare_stag
-            else:  # HARE, STAG
-                r1 = c.R_hare_stag
-                r2 = c.R_stag_hare
-            total_r1 += r1
-            total_r2 += r2
-        return total_r1, total_r2
+        last = self.history[-1] if self.history else [cfg.action_names[1]] * cfg.num_players
+        effective = [actions[i] if legal[i] else last[i] for i in range(cfg.num_players)]
+        return self.step(effective)
+
+
+# ============================================================================
+# Fixed Opponents (for non-LLM players)
+# ============================================================================
+
+class Opponent:
+    def reset(self) -> None:
+        pass
+
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        raise NotImplementedError
+
+
+class AlwaysStag(Opponent):
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        return "stag"
+
+
+class AlwaysHare(Opponent):
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        return "hare"
+
+
+class RandomOpponent(Opponent):
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        return str(np.random.choice(["stag", "hare"]))
+
+
+class CopyFocalLast(Opponent):
+    """
+    Copies the focal player's last action (default focal=Player 0).
+    This is a rough "TFT-like" behavior in a simultaneous-action setting.
+    """
+
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        history = obs.get("history", [])
+        if not history:
+            return "hare"
+        last = history[-1]
+        return last[focal_id]
+
+
+def make_opponent(opponent_type: str) -> Opponent:
+    opponents = {
+        "always_stag": AlwaysStag,
+        "always_hare": AlwaysHare,
+        "random": RandomOpponent,
+        "copy_focal": CopyFocalLast,
+    }
+    if opponent_type not in opponents:
+        raise ValueError(f"Unknown opponent type: {opponent_type}")
+    return opponents[opponent_type]()

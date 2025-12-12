@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, Tuple
 import numpy as np
 
-from .stag_hunt import StagHuntConfig
+from envs.stag_hunt import StagHuntConfig
 
 
 def _player_label(i: int) -> str:

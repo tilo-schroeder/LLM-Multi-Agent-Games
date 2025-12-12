@@ -13,7 +13,7 @@ from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-from .stag_hunt import StagHuntConfig, StagHuntEnv, Opponent, make_opponent
+from envs.stag_hunt import StagHuntConfig, StagHuntEnv, Opponent, make_opponent
 from .prompting import build_stag_hunt_prompt_with_chat_template, extract_action_from_completion
 from .rewards import compute_moral_reward
 from .ppo import PPOConfig, PolicyModelWithValueHead, Experience, compute_log_probs
