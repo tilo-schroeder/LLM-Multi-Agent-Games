@@ -5,4 +5,5 @@ outputs
 plots
 eval_plots
 eval_outputs
+debug_generations.jsonl
 __pycache__

@@ -20,6 +20,10 @@ mkdir -p logs
 export HF_HOME="${HF_HOME:-$SCRATCH/hf-cache}"
 mkdir -p "$HF_HOME"
 
-python -m experiment.evaluate --checkpoint_dir ./outputs/utilitarian_vs_always_cooperate/agent_final --num_players 2
+python -m experiment.evaluate \
+  --checkpoint_dir ./outputs/final_tests/stag_hunt_n3_thr2_llm_vs_llm_game/final/player_0 \
+  --tokenizer_dir  ./outputs/final_tests/stag_hunt_n3_thr2_llm_vs_llm_game/final \
+  --num_players 2  \
+  --temperature 0.2 --top_p 0.9
 
 echo "Done."

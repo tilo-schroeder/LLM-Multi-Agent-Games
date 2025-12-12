@@ -46,16 +46,25 @@ class StagHuntConfig:
     num_players: int = 2
     max_steps: int = 1
 
+    # Environment actions (internal semantics)
     action_names: Tuple[str, str] = ("stag", "hare")
 
+    # LLM-visible "legal" action tokens (stabilizes parsing & PPO)
+    action_tokens: Tuple[str, str] = ("action1", "action2")
+
     # Threshold Stag Hunt:
-    # - If #stag >= threshold: stag players get stag_success_reward
-    # - Else: stag players get stag_fail_reward
-    # - Hare players always get hare_reward
     threshold: int = 2
     stag_success_reward: float = 4.0
     stag_fail_reward: float = 0.0
     hare_reward: float = 2.0
+
+    def token_to_action(self, tok: str) -> str:
+        """Map LLM token -> env action."""
+        if tok == self.action_tokens[0]:
+            return self.action_names[0]  # action1 -> stag
+        if tok == self.action_tokens[1]:
+            return self.action_names[1]  # action2 -> hare
+        return self.action_names[1]
 
 
 class StagHuntEnv:
@@ -73,7 +82,7 @@ class StagHuntEnv:
         self.history = []
         self.step_count = 0
 
-        # Keep the "random previous move" initialization pattern from the IPD script
+        # Random previous move initialization
         if random_initial_state:
             acts = list(self.config.action_names)
             prev = [str(np.random.choice(acts)) for _ in range(self.config.num_players)]
@@ -100,10 +109,24 @@ class StagHuntEnv:
         done = self.step_count >= cfg.max_steps
         return {"history": [h.copy() for h in self.history]}, payoffs, done, {}
 
-    def illegal_step(self) -> Tuple[Dict[str, Any], List[float], bool, Dict]:
-        self.step_count += 1
-        done = self.step_count >= self.config.max_steps
-        return {"history": [h.copy() for h in self.history]}, [0.0] * self.config.num_players, done, {}
+    def step_with_legality(
+        self,
+        actions: List[str],
+        legal: List[bool],
+    ) -> Tuple[Dict[str, Any], List[float], bool, Dict]:
+        """
+        If a player is illegal, do NOT let their action update the public state.
+        We freeze their action to the previous state's action for state update/payoff calc.
+
+        (The illegal player still receives illegal penalty in your reward function.)
+        """
+        cfg = self.config
+        assert len(actions) == cfg.num_players
+        assert len(legal) == cfg.num_players
+
+        last = self.history[-1] if self.history else [cfg.action_names[1]] * cfg.num_players
+        effective = [actions[i] if legal[i] else last[i] for i in range(cfg.num_players)]
+        return self.step(effective)
 
 
 # ============================================================================
@@ -177,14 +200,24 @@ def build_stag_hunt_prompt_with_chat_template(
     history = obs.get("history", [])
 
     stag, hare = cfg.action_names
+    t1, t2 = cfg.action_tokens
+
+    # Randomize display order of the two tokens to reduce positional shortcutting
+    toks = [t1, t2]
+    np.random.shuffle(toks)
+    tA, tB = toks[0], toks[1]
+
     prompt = f"""You are playing a game with {cfg.num_players-1} other agents. You are Player {me}.
-Each round, every player chooses one action: {stag} or {hare}.
+Each round, every player chooses exactly one action token: {tA} or {tB}.
+
+Token meanings (internal):
+- {t1} means {stag}
+- {t2} means {hare}
 
 Payoffs:
 - If at least {cfg.threshold} players choose {stag}, then each player who chose {stag} gets {cfg.stag_success_reward} points.
 - Otherwise, each player who chose {stag} gets {cfg.stag_fail_reward} points.
 - Any player who chose {hare} always gets {cfg.hare_reward} points.
-
 """
 
     if history:
@@ -194,27 +227,32 @@ Payoffs:
             prompt += f"- Player {_player_label(i)} played {a}\n"
 
     prompt += f"""
-What action would you take in order to achieve the highest possible score in points?
+What action token would you output in order to achieve the highest possible score in points?
 
-Your answer must follow this format exactly: choose either {stag} or {hare}. Do not explain your reasoning. Your answer:"""
+Your answer must follow this format exactly: choose either {tA} or {tB}. Do not explain your reasoning. Your answer:"""
 
     messages = [{"role": "user", "content": prompt}]
-    try:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    except Exception:
-        return prompt
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-def extract_action_from_completion(completion: str, action_names: Tuple[str, str]) -> Tuple[str, bool]:
+def extract_action_from_completion(completion: str, legal_tokens: Tuple[str, str]) -> Tuple[str, bool]:
+    """
+    Parse one of the legal action tokens exactly.
+    Returns (token, is_legal). If illegal, returns ("illegal", False).
+    """
     completion = completion.strip()
-    pattern = r"^\s*(" + "|".join(re.escape(a) for a in action_names) + r")\s*[\.\!\?]?\s*$"
+
+    # exact match (case-insensitive), allow trailing punctuation
+    pattern = r"^\s*(" + "|".join(re.escape(a) for a in legal_tokens) + r")\s*[\.\!\?]?\s*$"
     m = re.match(pattern, completion, flags=re.IGNORECASE)
-    if m:
-        chosen = m.group(1).lower()
-        for a in action_names:
-            if a.lower() == chosen:
-                return a, True
-    return action_names[0], False
+    if not m:
+        return "illegal", False
+
+    chosen = m.group(1).lower()
+    for a in legal_tokens:
+        if a.lower() == chosen:
+            return a, True
+    return "illegal", False
 
 
 # ============================================================================
@@ -315,14 +353,15 @@ class PPOConfig:
     xi: float = 3.0
     illegal_penalty: float = -6.0
     reward_scale: float = 1.0
-    normalize_rewards: bool = False
+    normalize_rewards: bool = True
     normalize_advantages: bool = True
     reward_shaping: bool = True
     valid_action_bonus: float = 0.1
+    grad_accum_steps: int = 4
 
     # Generation
     max_new_tokens: int = 8  # will be overwritten based on tokenization of actions
-    temperature: float = 0.7
+    temperature: float = 0.2
     top_p: float = 0.9
 
     # Output
@@ -330,6 +369,10 @@ class PPOConfig:
     seed: int = 42
     log_every: int = 10
     save_every: int = 100
+
+    debug_log_path: str = "./debug_generations.jsonl"
+    debug_log_topk: int = 10
+    debug_log_only_illegal: bool = False
 
 
 class ValueHead(nn.Module):
@@ -425,7 +468,14 @@ def compute_log_probs(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     prompt_length: int,
+    gen_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      total_log_prob: sum of logprobs over generated tokens only (length = gen_len)
+      value: value estimate (we keep value from prompt end token)
+      gen_logits: logits over generated positions only (for entropy)
+    """
     base_model = model.base_model
     outputs = base_model(
         input_ids=input_ids,
@@ -435,6 +485,7 @@ def compute_log_probs(
     logits = outputs.logits
     hidden_states = outputs.hidden_states[-1]
 
+    # shift for next-token likelihood
     shift_logits = logits[:, :-1, :]
     shift_labels = input_ids[:, 1:]
 
@@ -442,20 +493,29 @@ def compute_log_probs(
     token_log_probs = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
 
     seq_len = shift_labels.shape[1]
+
+    # Score ONLY the generated segment
+    start = prompt_length - 1
+    end = start + gen_len  # exclusive (in shifted space)
+
     mask = torch.zeros_like(token_log_probs)
-    if prompt_length - 1 < seq_len:
-        mask[:, prompt_length - 1:] = 1.0
+    if start < seq_len:
+        mask[:, start:min(end, seq_len)] = 1.0
+
     if attention_mask is not None:
-        mask = mask * attention_mask[:, 1:]
+        mask = mask * attention_mask[:, 1:]  # align with shift_labels
 
     total_log_prob = (token_log_probs * mask).sum(dim=-1)
 
+    # Value from the last prompt token hidden state
     value_token_idx = prompt_length - 1
     value_hidden = hidden_states[:, value_token_idx, :]
     value = model.value_head(value_hidden)
 
-    gen_logits = shift_logits[:, prompt_length - 1:, :]
+    # logits only on generated positions
+    gen_logits = shift_logits[:, start:min(end, seq_len), :]
     return total_log_prob, value, gen_logits
+
 
 
 @dataclass
@@ -464,14 +524,18 @@ class Experience:
     completion: str
     input_ids: torch.Tensor
     prompt_length: int
+    gen_len: int
+
     reward: float
     value: float
     log_prob: float
     ref_log_prob: float
+
     action: str
     opponent_prev_actions: Optional[List[str]]
     is_legal: bool
     player_id: int = 0
+
     advantage: float = 0.0
     returns: float = 0.0
 
@@ -498,6 +562,9 @@ class MoralPPOTrainer:
 
         self.stats_history: List[Dict[str, Any]] = []
         self.reward_history = deque(maxlen=1000)
+
+        # Adaptive KL controller state
+        self.ref_kl_coef = float(config.ref_kl_coef)
 
         self._setup_models_and_tokenizer()
         self._setup_game()
@@ -531,7 +598,6 @@ class MoralPPOTrainer:
 
     def _setup_game(self):
         cfg = self.config
-        # Stag Hunt config
         self.env_config = StagHuntConfig(
             num_players=cfg.num_players,
             max_steps=cfg.batch_size,
@@ -540,9 +606,10 @@ class MoralPPOTrainer:
             stag_fail_reward=cfg.stag_fail_reward,
             hare_reward=cfg.hare_reward,
         )
-        # Set generation tokens based on action tokenization
-        cfg.max_new_tokens = _infer_max_new_tokens_for_actions(self.tokenizer, self.env_config.action_names)
-        print(f"Setting max_new_tokens={cfg.max_new_tokens} based on action tokenization for {self.env_config.action_names}")
+
+        # IMPORTANT: set generation length based on legal action TOKENS
+        cfg.max_new_tokens = _infer_max_new_tokens_for_actions(self.tokenizer, self.env_config.action_tokens)
+        print(f"Setting max_new_tokens={cfg.max_new_tokens} based on action tokenization for {self.env_config.action_tokens}")
 
     def _setup_players(self):
         cfg = self.config
@@ -599,6 +666,77 @@ class MoralPPOTrainer:
             for pid in range(1, cfg.num_players):
                 self.fixed_opponents[pid] = make_opponent(cfg.opponent_type)
 
+    def _episode_action_conditioned_stats(self, exps: List[Experience], pid: int) -> Dict[str, float]:
+        """
+        Returns per-episode fractions of (agent_action, opponent_prev_state) pairs.
+
+        For N=2, opponent_prev_state is the single opponent's previous action: "stag" or "hare".
+        For N>2, opponent_prev_state is bucketed as: "stagcount{k}" where k is #opponents who played "stag" last round.
+
+        Keys look like:
+        p0_cat_stag_prev_stag
+        p0_cat_hare_prev_stag
+        p0_cat_illegal_prev_stag
+        p0_cat_stag_prev_hare
+        ...
+        and sum (approximately) to 1 across categories for that player in that episode.
+        """
+        cfg = self.config
+        stag, hare = self.env_config.action_names
+
+        total = len(exps)
+        if total == 0:
+            return {}
+
+        # Determine the set of possible "prev" states so we always log stable keys
+        if cfg.num_players == 2:
+            prev_states = [stag, hare]
+        else:
+            # bucket by how many opponents previously played "stag"
+            prev_states = [f"stagcount{k}" for k in range(cfg.num_players)]  # opponents count is (num_players-1), but 0..num_players-1 is safe
+
+        # actions we track (legal actions + illegal bucket)
+        act_states = [stag, hare, "illegal"]
+
+        counts = {(a, p): 0 for a in act_states for p in prev_states}
+
+        for e in exps:
+            # agent action bucket
+            a = e.action if e.is_legal else "illegal"
+
+            # opponent previous bucket
+            if not e.opponent_prev_actions:
+                # should be rare given your reset(), but keep it defined
+                if cfg.num_players == 2:
+                    prev = hare
+                else:
+                    prev = "stagcount0"
+            else:
+                if cfg.num_players == 2:
+                    prev = e.opponent_prev_actions[0]
+                else:
+                    k = sum(1 for x in e.opponent_prev_actions if x == stag)
+                    prev = f"stagcount{k}"
+
+            if (a, prev) in counts:
+                counts[(a, prev)] += 1
+
+        out: Dict[str, float] = {}
+        for prev in prev_states:
+            for a in act_states:
+                key = f"p{pid}_cat_{a}_prev_{prev}"
+                out[key] = counts[(a, prev)] / float(total)
+
+        return out
+    
+    def _debug_log(self, payload: Dict[str, Any]):
+        path = self.config.debug_log_path
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
     def rollout_episode(self) -> Dict[int, List[Experience]]:
         cfg = self.config
         env = StagHuntEnv(self.env_config)
@@ -633,11 +771,13 @@ class MoralPPOTrainer:
                         obs, self.tokenizer, self.env_config, player_id=pid
                     )
 
-                    encoded = self.tokenizer(prompt, return_tensors="pt", padding=False, truncation=True).to(dev)
+                    encoded = self.tokenizer(
+                        prompt, return_tensors="pt", padding=False, truncation=True
+                    ).to(dev)
                     prompt_length = encoded["input_ids"].shape[1]
 
                     with torch.no_grad():
-                        output_ids = model.generate(
+                        gen_out = model.generate(
                             input_ids=encoded["input_ids"],
                             attention_mask=encoded["attention_mask"],
                             max_new_tokens=cfg.max_new_tokens,
@@ -645,30 +785,78 @@ class MoralPPOTrainer:
                             temperature=cfg.temperature,
                             top_p=cfg.top_p,
                             pad_token_id=self.tokenizer.pad_token_id,
+                            return_dict_in_generate=True,
+                            output_scores=True,
                         )
 
-                    full_ids = output_ids
+                    full_ids = gen_out.sequences  # [1, prompt+gen]
+                    gen_len = int(full_ids.shape[1] - prompt_length)
                     attn = torch.ones_like(full_ids)
 
                     with torch.no_grad():
-                        log_prob, value, _ = compute_log_probs(model, full_ids, attn, prompt_length)
+                        log_prob, value, _ = compute_log_probs(model, full_ids, attn, prompt_length, gen_len)
 
                         ref_dev = _model_device(self.ref_model)
                         ref_ids = full_ids.to(ref_dev)
                         ref_attn = torch.ones_like(ref_ids)
-                        ref_log_prob, _, _ = compute_log_probs(self.ref_model, ref_ids, ref_attn, prompt_length)
+                        ref_log_prob, _, _ = compute_log_probs(self.ref_model, ref_ids, ref_attn, prompt_length, gen_len)
 
-                    completion = self.tokenizer.decode(output_ids[0, prompt_length:], skip_special_tokens=True).strip()
-                    act, is_legal = extract_action_from_completion(completion, self.env_config.action_names)
+                    completion = self.tokenizer.decode(
+                        full_ids[0, prompt_length:], skip_special_tokens=True
+                    ).strip()
+
+                    tok, is_legal = extract_action_from_completion(
+                        completion, self.env_config.action_tokens
+                    )
+
+                    if is_legal:
+                        act = self.env_config.token_to_action(tok)
+                    else:
+                        act = hare  # arbitrary; env.step_with_legality will freeze state anyway
 
                     actions[pid] = act
                     legal[pid] = is_legal
+
+                    # Debug logging (keep yours; optional)
+                    gen_ids = full_ids[0, prompt_length:].tolist()
+                    gen_tokens = self.tokenizer.convert_ids_to_tokens(gen_ids)
+
+                    topk = []
+                    if getattr(gen_out, "scores", None) and len(gen_out.scores) > 0:
+                        first_logits = gen_out.scores[0][0]
+                        probs = torch.softmax(first_logits, dim=-1)
+                        k = min(cfg.debug_log_topk, probs.numel())
+                        vals, idxs = torch.topk(probs, k)
+                        topk = [
+                            {
+                                "token_id": int(i.item()),
+                                "token": self.tokenizer.convert_ids_to_tokens(int(i.item())),
+                                "prob": float(v.item()),
+                            }
+                            for v, i in zip(vals, idxs)
+                        ]
+
+                    if (not cfg.debug_log_only_illegal) or (not is_legal):
+                        self._debug_log({
+                            "t": int(_t),
+                            "player_id": int(pid),
+                            "max_new_tokens": int(cfg.max_new_tokens),
+                            "prompt_tail": prompt[-500:],
+                            "completion_raw": completion,
+                            "parsed_token": tok,
+                            "parsed_action": act,
+                            "is_legal": bool(is_legal),
+                            "gen_token_ids": gen_ids,
+                            "gen_tokens": gen_tokens,
+                            "topk_first_token": topk,
+                        })
 
                     step_exps[pid] = Experience(
                         prompt=prompt,
                         completion=completion,
                         input_ids=full_ids.detach().cpu(),
                         prompt_length=prompt_length,
+                        gen_len=gen_len,
                         reward=0.0,
                         value=float(value.item()),
                         log_prob=float(log_prob.item()),
@@ -678,17 +866,14 @@ class MoralPPOTrainer:
                         is_legal=is_legal,
                         player_id=pid,
                     )
+
                 else:
-                    # Fixed opponent
                     opp = self.fixed_opponents[pid]
                     actions[pid] = opp.act(obs, player_id=pid, focal_id=0)
                     legal[pid] = True
 
-            # 2) Environment step
-            if all(legal):
-                next_obs, payoffs, done, _ = env.step(actions)
-            else:
-                next_obs, payoffs, done, _ = env.illegal_step()
+            # 2) Environment step (legality-aware)
+            next_obs, payoffs, done, _ = env.step_with_legality(actions, legal)
 
             # 3) Rewards for LLM players
             for pid, exp in step_exps.items():
@@ -728,14 +913,16 @@ class MoralPPOTrainer:
 
         task_rewards = np.array([e.reward for e in all_exps], dtype=np.float32)
 
-        if cfg.ref_kl_coef != 0.0:
+        # KL-to-reference shaping (adaptive coef)
+        if self.ref_kl_coef != 0.0:
             kl_terms = np.array([e.log_prob - e.ref_log_prob for e in all_exps], dtype=np.float32)
-            rewards = task_rewards - cfg.ref_kl_coef * kl_terms
+            rewards = task_rewards - float(self.ref_kl_coef) * kl_terms
         else:
             rewards = task_rewards.copy()
 
         rewards = rewards * cfg.reward_scale
 
+        # Reward normalization (recommended for stability)
         if cfg.normalize_rewards and len(rewards) > 1:
             std = rewards.std()
             rewards = (rewards - rewards.mean()) / (std + 1e-8) if std > 1e-6 else (rewards - rewards.mean())
@@ -785,11 +972,11 @@ class MoralPPOTrainer:
         return all_exps
 
     def ppo_update(
-        self,
-        experiences: List[Experience],
-        model: PolicyModelWithValueHead,
-        optimizer: AdamW
-    ) -> Dict[str, float]:
+    self,
+    experiences: List[Experience],
+    model: PolicyModelWithValueHead,
+    optimizer: AdamW
+) -> Dict[str, float]:
         cfg = self.config
         model.train()
         device = _model_device(model)
@@ -797,7 +984,7 @@ class MoralPPOTrainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
-        total_kl = 0.0
+        total_approx_kl = 0.0
         num_updates = 0
 
         if not experiences:
@@ -805,6 +992,8 @@ class MoralPPOTrainer:
 
         for _epoch in range(cfg.ppo_epochs):
             indices = np.random.permutation(len(experiences))
+            optimizer.zero_grad(set_to_none=True)
+            accum = 0
 
             for idx in indices:
                 exp = experiences[idx]
@@ -815,9 +1004,10 @@ class MoralPPOTrainer:
                 attention_mask = torch.ones_like(input_ids)
 
                 log_prob, value, gen_logits = compute_log_probs(
-                    model, input_ids, attention_mask, exp.prompt_length
+                    model, input_ids, attention_mask, exp.prompt_length, exp.gen_len
                 )
 
+                # Entropy on generated segment only
                 gen_probs = F.softmax(gen_logits, dim=-1)
                 gen_log_probs = F.log_softmax(gen_logits, dim=-1)
                 entropy = -(gen_probs * gen_log_probs).sum(dim=-1).mean()
@@ -834,43 +1024,53 @@ class MoralPPOTrainer:
                 surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advantage
                 policy_loss = -torch.min(surr1, surr2)
 
-                value_clipped = old_value + torch.clamp(
-                    value - old_value, -cfg.clip_ratio, cfg.clip_ratio
-                )
+                # Value clipping (standard PPO trick)
+                value_clipped = old_value + torch.clamp(value - old_value, -cfg.clip_ratio, cfg.clip_ratio)
                 value_loss1 = (value - returns) ** 2
                 value_loss2 = (value_clipped - returns) ** 2
                 value_loss = 0.5 * torch.max(value_loss1, value_loss2)
 
-                approx_kl = 0.5 * (old_log_prob - log_prob) ** 2
+                # PPO approx KL diagnostic (not used in loss)
+                approx_kl = (old_log_prob - log_prob).mean()
 
                 loss = (
                     policy_loss
                     + cfg.vf_coef * value_loss
-                    + cfg.kl_coef * approx_kl
                     - cfg.entropy_coef * entropy
                 )
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                optimizer.step()
+                (loss / cfg.grad_accum_steps).backward()
+                accum += 1
 
+                # Stats
                 total_policy_loss += float(policy_loss.item())
                 total_value_loss += float(value_loss.item())
-                total_kl += float(approx_kl.item())
                 total_entropy += float(entropy.item())
+                total_approx_kl += float(approx_kl.item())
                 num_updates += 1
 
+                if accum % cfg.grad_accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+            # Flush remainder
+            if accum % cfg.grad_accum_steps != 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            # Early-stop on KL (optional)
             if num_updates > 0 and cfg.target_kl:
-                avg_kl = total_kl / num_updates
-                if avg_kl > cfg.target_kl * 1.5:
+                avg_kl = total_approx_kl / num_updates
+                if abs(avg_kl) > cfg.target_kl * 1.5:
                     break
 
         n = max(num_updates, 1)
         return {
             "policy_loss": total_policy_loss / n,
             "value_loss": total_value_loss / n,
-            "kl": total_kl / n,
+            "kl": total_approx_kl / n,
             "entropy": total_entropy / n,
         }
 
@@ -904,9 +1104,25 @@ class MoralPPOTrainer:
                 exps = self.compute_advantages(trajs)
                 upd = self.ppo_update(exps, self.player_models[pid], self.player_optimizers[pid])
 
-                coop = sum(1 for e in exps if e.action == "stag") / max(len(exps), 1)
-                ill = sum(1 for e in exps if not e.is_legal) / max(len(exps), 1)
+                if exps and cfg.target_kl:
+                    kls = [((e.log_prob - e.ref_log_prob) / max(e.gen_len, 1)) for e in exps]
+                    avg_kl = float(np.mean(kls))
 
+                    if avg_kl > cfg.target_kl * 1.5:
+                        self.ref_kl_coef *= 1.5
+                    elif avg_kl < cfg.target_kl / 1.5:
+                        self.ref_kl_coef /= 1.5
+
+                    self.ref_kl_coef = float(np.clip(self.ref_kl_coef, 1e-4, 10.0))
+
+                    stats["kl_per_token"] = avg_kl
+                    stats["ref_kl_coef"] = self.ref_kl_coef
+
+                legal_exps = [e for e in exps if e.is_legal]
+                coop = sum(1 for e in legal_exps if e.action == "stag") / max(len(legal_exps), 1)
+                ill = 1.0 - (len(legal_exps) / max(len(exps), 1))
+
+                stats.update(self._episode_action_conditioned_stats(exps, pid))
                 stats.update({
                     f"p{pid}_mean_reward": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
                     f"p{pid}_std_reward": float(np.std(raw_rewards)) if raw_rewards else 0.0,

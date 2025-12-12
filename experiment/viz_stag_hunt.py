@@ -55,6 +55,103 @@ def series(stats: List[Dict], key: str) -> Optional[List[float]]:
     return [float(s.get(key, np.nan)) for s in stats]
 
 
+def detect_conditioned_categories(stats: List[Dict]) -> Dict[int, List[Tuple[str, str]]]:
+    """
+    Finds keys of the form: p{pid}_cat_{act}_prev_{prev}
+    Returns {pid: [(act, prev), ...]}.
+    """
+    if not stats:
+        return {}
+    cats = {}
+    pat = re.compile(r"^p(\d+)_cat_(.+?)_prev_(.+?)$")
+    for k in stats[0].keys():
+        m = pat.match(k)
+        if m:
+            pid = int(m.group(1))
+            act = m.group(2)
+            prev = m.group(3)
+            cats.setdefault(pid, set()).add((act, prev))
+    return {pid: sorted(list(s)) for pid, s in cats.items()}
+
+
+def collect_conditioned_series(stats: List[Dict], pid: int) -> Dict[Tuple[str, str], List[float]]:
+    """
+    Returns {(act, prev): [values per episode]}
+    """
+    out = {}
+    pat = re.compile(rf"^p{pid}_cat_(.+?)_prev_(.+?)$")
+    # Build list from first row to keep stable ordering
+    keys = []
+    for k in stats[0].keys():
+        m = pat.match(k)
+        if m:
+            keys.append((m.group(1), m.group(2), k))  # (act, prev, full_key)
+
+    for act, prev, full_key in keys:
+        out[(act, prev)] = [float(s.get(full_key, 0.0)) for s in stats]
+    return out
+
+
+def plot_conditioned_stack(
+    episodes: List[int],
+    cat_series: Dict[Tuple[str, str], List[float]],
+    window: int,
+    title: str,
+    out_path: str,
+    dpi: int,
+):
+    """
+    Stacked area plot of episode fractions for each (act, prev) category.
+    """
+    if not cat_series:
+        return
+
+    # Optional smoothing
+    def smooth(y: List[float]) -> Tuple[List[int], np.ndarray]:
+        y_ma = moving_average(y, window)
+        if len(y_ma) == len(y):
+            return episodes, y_ma
+        else:
+            return episodes[window - 1 :], y_ma
+
+    # Heuristic ordering to look like the paper: group by prev then action; keep illegal last
+    acts = sorted({a for (a, _p) in cat_series.keys()})
+    # Put illegal last if present
+    if "illegal" in acts:
+        acts = [a for a in acts if a != "illegal"] + ["illegal"]
+    prevs = sorted({p for (_a, p) in cat_series.keys()})
+
+    ordered = []
+    for p in prevs:
+        for a in acts:
+            if (a, p) in cat_series:
+                ordered.append((a, p))
+
+    # Build stacked arrays (after smoothing)
+    ep_plot = None
+    Ys = []
+    labels = []
+    for (a, p) in ordered:
+        ep_s, y_s = smooth(cat_series[(a, p)])
+        if ep_plot is None:
+            ep_plot = ep_s
+        Ys.append(y_s)
+        labels.append(f"{a} | prev={p}")
+
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    ax.stackplot(ep_plot, Ys, labels=labels, alpha=0.9)
+    ax.set_title(title)
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Fraction of steps in episode")
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", ncols=2, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 def plot_multi(
     ax,
     episodes: List[int],
@@ -177,6 +274,21 @@ def main():
 
     save_single("reward.png", reward, "Mean reward", "Reward")
     save_single("stag_rate.png", stag, "Stag rate", "Rate", ylim=(0, 1))
+
+    cond = detect_conditioned_categories(stats)
+    for pid in players:
+        if pid not in cond:
+            continue
+        cat_series = collect_conditioned_series(stats, pid)
+        out_path = os.path.join(args.output_dir, f"action_conditioned_p{pid}.png")
+        plot_conditioned_stack(
+            episodes=episodes,
+            cat_series=cat_series,
+            window=args.window,
+            title=f"Action distribution conditioned on opponent previous move (P{pid})",
+            out_path=out_path,
+            dpi=args.dpi,
+        )
 
 if __name__ == "__main__":
     main()
