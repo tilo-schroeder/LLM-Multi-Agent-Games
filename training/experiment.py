@@ -1,35 +1,31 @@
-"""
-Self-play GRPO-style finetuning on a 2-player repeated Stag Hunt game,
-where each player is a *local decision* LLM policy.
+"""Self-play PPO finetuning on a 2-player repeated Stag Hunt game,
+where Player 1 is an LLM local-decision policy trained against a fixed
+(opponent_type) strategy such as Tit-for-Tat, Always Cooperate, etc.
 
-This updated version supports TWO learning agents (Player 1 and Player 2),
-each with its own model and optimizer, trained via self-play with
-intrinsic / moral rewards.
+This script implements PPO (Proximal Policy Optimization) for LLM training
+with custom environment rewards.
 
-We also keep the one-learning-agent-vs-Tit-for-Tat rollout utilities,
-and we can switch between:
-
-- setup="tft":      Player 1 (LLM) vs fixed Tit-for-Tat opponent
-- setup="two_llm":  Player 1 (LLM) vs Player 2 (LLM), both learning
-
-Both use local decision prompts with per-round intrinsic rewards:
-    - "game":               own material payoff
-    - "deontological":      penalty for defecting vs previous cooperator
-    - "utilitarian":        own + opponent payoff
-    - "game+deontological": game payoff minus norm-violation term
-Illegal outputs (not of the form "ACTION: STAG/HARE") are penalized.
+FIXES from v1:
+- Added proper value function initialization and normalization
+- Added reward normalization/scaling
+- Added early stopping on KL divergence
+- Added proper entropy calculation
+- Fixed advantage computation to handle per-token vs per-sequence
+- Added gradient accumulation for stability
+- Added repetition penalty detection
 """
 
 import os
 import json
 import csv
-import logging
 import argparse
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import Dict, Any
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import (
     AutoTokenizer,
@@ -41,119 +37,138 @@ from envs.stag_hunt import StagHuntEnv, StagHuntConfig
 from utils.logging_utils import get_logger
 
 import matplotlib
-matplotlib.use("Agg")  # safe for SLURM/non-GUI environments
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Self-play GRPO-style finetuning on repeated Stag Hunt."
+        description="PPO finetuning on repeated Stag Hunt (LLM vs fixed opponent)."
     )
-
-    # High-level setup
-    parser.add_argument(
-        "--setup",
-        type=str,
-        choices=["tft", "two_llm", "shared_llm"],
-        default="tft",
-        help=(
-            'Training setup: '
-            '"tft" (LLM vs fixed opponent such as Tit-for-Tat), '
-            '"two_llm" (two separate learning LLMs), or '
-            '"shared_llm" (two players share a single policy).'
-        ),
-    )
-
-    parser.add_argument(
-        "--opponent_type",
-        type=str,
-        choices=["tft", "always_cooperate", "always_defect", "random"],
-        default="tft",
-        help=(
-            'Fixed opponent strategy when setup="tft": '
-            '"tft", "always_cooperate", "always_defect", or "random".'
-        ),
-    )
-
-    # Models
-    parser.add_argument(
-        "--model_p1",
-        type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
-        help="Base model name for Player 1 (HF repo id or local path).",
-    )
-    parser.add_argument(
-        "--model_p2",
-        type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
-        help="Base model name for Player 2 (if None, use model_p1).",
-    )
-
-    # Temperature / sampling
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature for generation.",
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.9,
-        help="Top-p (nucleus) sampling parameter.",
-    )
-
-    # Reward / moral type
-    parser.add_argument(
-        "--moral_type",
-        type=str,
-        choices=["game", "deontological", "utilitarian", "game+deontological"],
-        default="utilitarian",
-        help="Type of intrinsic/moral reward.",
-    )
-
-    # Training hyperparameters
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-5,
-        help="Learning rate.",
-    )
-    parser.add_argument(
-        "--num_updates",
-        type=int,
-        default=30,
-        help="Number of gradient updates.",
-    )
-    parser.add_argument(
-        "--episodes_per_batch",
-        type=int,
-        default=8,
-        help="Number of episodes collected per update.",
-    )
-    parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Gradient clipping norm.",
-    )
-
-    # Environment config
-    parser.add_argument(
-        "--num_rounds",
-        type=int,
-        default=5,
-        help="Number of repeated rounds in the Stag Hunt game.",
-    )
-
-    # Output / logging
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./runs/tft_utilitarian_with_full_logging",
-        help="Directory to save models, logs, and plots.",
-    )
-
+    parser.add_argument("--opponent_type", type=str, choices=["tft", "always_cooperate", "always_defect", "random"], default="tft")
+    parser.add_argument("--model_p1", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--moral_type", type=str, choices=["game", "deontological", "utilitarian", "game+deontological"], default="utilitarian")
+    parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate (reduced for stability)")
+    parser.add_argument("--num_updates", type=int, default=30)
+    parser.add_argument("--episodes_per_batch", type=int, default=8)
+    parser.add_argument("--ppo_epochs", type=int, default=4)
+    parser.add_argument("--mini_batch_size", type=int, default=4)
+    parser.add_argument("--max_grad_norm", type=float, default=0.5, help="Gradient clipping (reduced)")
+    parser.add_argument("--kl_coef", type=float, default=0.2, help="KL penalty coefficient (increased)")
+    parser.add_argument("--target_kl", type=float, default=0.01, help="Target KL for early stopping")
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--lam", type=float, default=0.95)
+    parser.add_argument("--cliprange", type=float, default=0.2)
+    parser.add_argument("--cliprange_value", type=float, default=0.2)
+    parser.add_argument("--vf_coef", type=float, default=0.5)
+    parser.add_argument("--entropy_coef", type=float, default=0.01)
+    parser.add_argument("--num_rounds", type=int, default=5)
+    parser.add_argument("--output_dir", type=str, default="./runs/ppo_tft_utilitarian")
+    parser.add_argument("--reward_scale", type=float, default=0.1, help="Scale rewards to prevent large gradients")
+    parser.add_argument("--normalize_rewards", action="store_true", default=True, help="Normalize rewards per batch")
+    parser.add_argument("--normalize_advantages", action="store_true", default=True, help="Normalize advantages")
+    parser.add_argument("--use_adaptive_kl", action="store_true", default=True, help="Use adaptive KL penalty")
     return parser.parse_args()
+
+
+class ValueHead(nn.Module):
+    """Value head with proper initialization for stable training."""
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout) # You forgot to use the dropout arg
+        self.dense = nn.Linear(hidden_size, hidden_size // 2)
+        self.dense2 = nn.Linear(hidden_size // 2, 1)
+        
+        # Initialize to output small values
+        nn.init.normal_(self.dense.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.dense.bias)
+        nn.init.normal_(self.dense2.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.dense2.bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states shape: [batch, seq_len, hidden]
+        # Use the last token's embedding
+        x = hidden_states[:, -1, :] 
+        x = self.dropout(x)
+        x = F.tanh(self.dense(x))
+        return self.dense2(x).squeeze(-1)
+
+
+class CausalLMWithValueHead(nn.Module):
+    def __init__(self, base_model: AutoModelForCausalLM):
+        super().__init__()
+        self.base_model = base_model
+        self.config = base_model.config
+        self.value_head = ValueHead(base_model.config.hidden_size)
+        
+        # Freeze embedding layers for stability (optional but helps)
+        # for param in self.base_model.model.embed_tokens.parameters():
+        #     param.requires_grad = False
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        outputs = self.base_model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            output_hidden_states=True, 
+            **kwargs
+        )
+        hidden_states = outputs.hidden_states[-1]
+        value = self.value_head(hidden_states)
+        return outputs, value
+
+    def generate(self, *args, **kwargs):
+        return self.base_model.generate(*args, **kwargs)
+
+    def save_pretrained(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        self.base_model.save_pretrained(path)
+        torch.save(self.value_head.state_dict(), os.path.join(path, "value_head.pt"))
+
+    @classmethod
+    def from_pretrained(cls, path: str, **kwargs):
+        base_model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
+        model = cls(base_model)
+        value_head_path = os.path.join(path, "value_head.pt")
+        if os.path.exists(value_head_path):
+            model.value_head.load_state_dict(torch.load(value_head_path, weights_only=True))
+        return model
+
+
+# =======================================
+# Reward normalization helper
+# =======================================
+
+class RunningMeanStd:
+    """Running mean and std for reward normalization."""
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = np.mean(x)
+        batch_var = np.var(x)
+        batch_count = len(x)
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 
 # =======================================
@@ -161,161 +176,69 @@ def parse_args():
 # =======================================
 
 class TitForTatOpponent:
-    """
-    Classic Tit-for-Tat opponent:
-
-    - Round 1: play STAG (cooperate).
-    - Later rounds: copy Player 1's last action.
-    """
-
-    def reset(self):
-        pass
-
+    def reset(self): pass
     def act(self, env_obs: Dict[str, Any]) -> str:
         history = env_obs["history"]
         if not history:
-            # First move: cooperate
             return StagHuntEnv.ACTION_STAG
-        last_a1, _ = history[-1]
-        # Copy last action of Player 1
-        return last_a1
+        return history[-1][0]
+
 
 class AlwaysCooperateOpponent:
-    """Always play STAG (cooperate)."""
-
-    def reset(self):
-        pass
-
+    def reset(self): pass
     def act(self, env_obs: Dict[str, Any]) -> str:
         return StagHuntEnv.ACTION_STAG
 
 
 class AlwaysDefectOpponent:
-    """Always play HARE (defect)."""
-
-    def reset(self):
-        pass
-
+    def reset(self): pass
     def act(self, env_obs: Dict[str, Any]) -> str:
         return StagHuntEnv.ACTION_HARE
 
 
 class RandomOpponent:
-    """Play STAG/HARE uniformly at random."""
-
-    def reset(self):
-        pass
-
+    def reset(self): pass
     def act(self, env_obs: Dict[str, Any]) -> str:
-        return np.random.choice(
-            [StagHuntEnv.ACTION_STAG, StagHuntEnv.ACTION_HARE]
-        )
+        return np.random.choice([StagHuntEnv.ACTION_STAG, StagHuntEnv.ACTION_HARE])
 
 
 def make_fixed_opponent(opponent_type: str):
-    """
-    Factory for fixed opponents.
-
-    opponent_type in {"tft", "always_cooperate", "always_defect", "random"}.
-    """
-    if opponent_type == "tft":
-        return TitForTatOpponent()
-    if opponent_type == "always_cooperate":
-        return AlwaysCooperateOpponent()
-    if opponent_type == "always_defect":
-        return AlwaysDefectOpponent()
-    if opponent_type == "random":
-        return RandomOpponent()
+    if opponent_type == "tft": return TitForTatOpponent()
+    if opponent_type == "always_cooperate": return AlwaysCooperateOpponent()
+    if opponent_type == "always_defect": return AlwaysDefectOpponent()
+    if opponent_type == "random": return RandomOpponent()
     raise ValueError(f"Unknown opponent_type: {opponent_type}")
 
 
-# =======================================
-# Moral reward functions for Stag Hunt
-# =======================================
-
-def compute_moral_reward_stag_hunt(
-    moral_type: str,
-    agent_action: str,
-    opp_prev_action: str,  # opponent's last move (None on first round)
-    r_agent: float,
-    r_opp: float,
-    is_legal: bool,
-    xi: float = 3.0,
-    illegal_penalty: float = -6.0,
-) -> float:
-    """
-    Intrinsic moral rewards for a Stag Hunt matrix game.
-
-    moral_type:
-      - "game"               : agent's own payoff (material reward)
-      - "deontological"      : -xi if defect vs previous cooperator, else 0
-      - "utilitarian"        : r_agent + r_opp
-      - "game+deontological" : game payoff minus xi on norm violation
-
-    Illegal actions (non-parsable completions) receive illegal_penalty.
-    """
+def compute_moral_reward_stag_hunt(moral_type, agent_action, opp_prev_action, r_agent, r_opp, is_legal, xi=3.0, illegal_penalty=-6.0):
     if not is_legal:
         return float(illegal_penalty)
-
-    COOP = StagHuntEnv.ACTION_STAG
-    DEFECT = StagHuntEnv.ACTION_HARE
-
+    COOP, DEFECT = StagHuntEnv.ACTION_STAG, StagHuntEnv.ACTION_HARE
     if moral_type == "game":
         return float(r_agent)
-
     if moral_type == "deontological":
-        if opp_prev_action is not None and opp_prev_action == COOP and agent_action == DEFECT:
-            return -float(xi)
-        else:
-            return 0.0
-
+        return -float(xi) if (opp_prev_action == COOP and agent_action == DEFECT) else 0.0
     if moral_type == "utilitarian":
         return float(r_agent + r_opp)
-
     if moral_type == "game+deontological":
         base = float(r_agent)
-        if opp_prev_action is not None and opp_prev_action == COOP and agent_action == DEFECT:
+        if opp_prev_action == COOP and agent_action == DEFECT:
             base -= float(xi)
         return base
-
     raise ValueError(f"Unknown moral_type: {moral_type}")
 
 
-# =======================================
-# Local decision prompting & parsing
-# =======================================
-
-def format_history_for_player(history: List[Tuple[str, str]]) -> str:
-    """
-    Format the state using only the last joint action.
-    """
+def format_history_for_player(history):
     if not history:
         return "You have not played with this opponent before.\n"
-
     last_a1, last_a2 = history[-1]
     return f"Last time, Player 1 chose {last_a1}, and Player 2 chose {last_a2}.\n"
 
 
-def build_decision_prompt(
-    player_id: int,
-    env_obs: Dict[str, Any],
-    config: StagHuntConfig,
-    tokenizer,
-) -> str:
-    """
-    Build a chat-formatted prompt for a single player decision,
-    using the model's chat template.
-    """
-    assert player_id in (1, 2)
-    round_idx = env_obs["round"] + 1  # 1-based
-    history = env_obs["history"]
-    history_text = format_history_for_player(history)
-
-    system_msg = (
-        f"You are playing as Player {player_id} "
-        f"in a repeated 2-player Stag Hunt game."
-    )
-
+def build_decision_prompt(player_id, env_obs, config, tokenizer):
+    round_idx = env_obs["round"] + 1
+    history_text = format_history_for_player(env_obs["history"])
+    system_msg = f"You are playing as Player {player_id} in a repeated 2-player Stag Hunt game."
     user_msg = f"""
 Game rules:
 - There are exactly 2 players and {config.num_rounds} rounds.
@@ -342,1540 +265,629 @@ Your task:
 
 Reply now with exactly one line.
 """.strip()
-
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return prompt
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-# Very restrictive parsing (any non perfect match is illegal)
-def extract_action_from_completion(text: str) -> Tuple[str, bool]:
-    """
-    Very strict: only accept if the completion is exactly one line
-    with format "ACTION: STAG" or "ACTION: HARE"
-    """
+def extract_action_from_completion(text):
+    """Extract action with better error handling."""
     text = text.strip()
     
-    # Check if it's a single line
-    if '\n' in text:
+    # Check for repetition (sign of degenerate output)
+    if len(text) > 50:
+        # Check if there's heavy repetition
+        words = text.split()
+        if len(words) > 5:
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.3:  # Too much repetition
+                return StagHuntEnv.ACTION_HARE, False
+    
+    if "\n" in text:
+        # Try to parse just the first line
+        first_line = text.split("\n")[0].strip()
+        if first_line.upper().startswith("ACTION:"):
+            tail = first_line.split(":", 1)[1].strip().upper()
+            if tail == "STAG": return StagHuntEnv.ACTION_STAG, True
+            if tail == "HARE": return StagHuntEnv.ACTION_HARE, True
         return StagHuntEnv.ACTION_HARE, False
     
     if not text.upper().startswith("ACTION:"):
         return StagHuntEnv.ACTION_HARE, False
     
     tail = text.split(":", 1)[1].strip().upper()
-    
-    if tail == "STAG":
-        return StagHuntEnv.ACTION_STAG, True
-    elif tail == "HARE":
-        return StagHuntEnv.ACTION_HARE, True
-    else:
-        return StagHuntEnv.ACTION_HARE, False
+    if tail == "STAG": return StagHuntEnv.ACTION_STAG, True
+    if tail == "HARE": return StagHuntEnv.ACTION_HARE, True
+    return StagHuntEnv.ACTION_HARE, False
 
-# ==================================
-# 4. Episode rollout & data logging
-# ==================================
 
 @dataclass
-class DecisionSample:
+class PPOStepData:
     episode_id: int
-    player_id: int
     round_idx: int
     prompt: str
     completion: str
-    # reward will be filled after decision; here it's intrinsic/moral reward
-    reward: float = 0.0
-    action: str = ""             # "STAG" or "HARE" (parsed action)
-    opp_prev_action: str = ""    # opponent's previous move, "" if none
-    is_legal: bool = True
+    input_ids: torch.Tensor
+    prompt_length: int
+    reward: float
+    value: float
+    log_prob: float
+    ref_log_prob: float  # Added: log prob under reference policy
+    action: str
+    opp_prev_action: str
+    is_legal: bool
+    advantage: float = 0.0
+    return_value: float = 0.0
 
 
-def log_completions(
-    samples: List[DecisionSample],
-    log_file: str,
-    meta: Dict[str, Any],
-) -> None:
-    """
-    Append used completions to a JSONL file.
-
-    Only logs:
-      - metadata (setup, update, moral_type, etc.)
-      - episode / player / round
-      - completion text
-      - parsed action, reward, legality
-
-    Does NOT log the full prompt.
-    """
-    if not samples:
-        return
-
+def log_completions(step_data_list, log_file, meta):
+    if not step_data_list: return
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
     with open(log_file, "a", encoding="utf-8") as f:
-        for s in samples:
-            row = {
-                "setup": meta.get("setup"),
-                "update": meta.get("update"),
-                "moral_type": meta.get("moral_type"),
-                "opponent_type": meta.get("opponent_type"),
-                "episode_id": s.episode_id,
-                "player_id": s.player_id,
-                "round_idx": s.round_idx,
-                "completion": s.completion,
-                "action": s.action,
-                "opp_prev_action": s.opp_prev_action,
-                "reward": s.reward,
-                "is_legal": s.is_legal,
-            }
+        for s in step_data_list:
+            row = {"setup": meta.get("setup"), "update": meta.get("update"), "moral_type": meta.get("moral_type"),
+                   "opponent_type": meta.get("opponent_type"), "episode_id": s.episode_id, "round_idx": s.round_idx,
+                   "completion": s.completion, "action": s.action, "opp_prev_action": s.opp_prev_action,
+                   "reward": s.reward, "value": s.value, "log_prob": s.log_prob, "is_legal": s.is_legal}
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def generate_completion(
-    model,
-    tokenizer,
-    prompt: str,
-    device: torch.device,
-    max_new_tokens: int = 48,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-) -> str:
-    """Generate a single completion for a local decision prompt.
-
-    Returns ONLY the model's continuation (no prompt, no roles),
-    decoded from the newly generated tokens.
+def compute_log_probs_and_entropy(model, input_ids, attention_mask, prompt_length, device):
     """
-    model.eval()
-    with torch.no_grad():
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        input_ids = inputs["input_ids"]
-
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-        # Take only the newly generated tokens
-        gen_ids = output_ids[0, input_ids.shape[1]:]
-
-        if gen_ids.numel() == 0:
-            # Model generated nothing new; treat as empty completion
-            return ""
-
-        completion = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-    return completion
-
-
-# ===== Moral agent vs Tit-for-Tat opponent =====
-
-def rollout_episode_vs_tft(
-    model,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    episode_id: int,
-    moral_type: str,
-    opponent: TitForTatOpponent,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    xi: float = 3.0,
-    illegal_penalty: float = -6.0,
-) -> Tuple[List[DecisionSample], float, List[float], int, int]:
-    """
+    Compute log probabilities, value, AND entropy for a sequence.
+    
     Returns:
-        samples: DecisionSample list for Player 1
-        total_moral_p1: sum of P1 moral rewards
-        tft_rewards: list of TFT (P2) moral rewards for each env step
-        p2_stag_count: how many times TFT played STAG
-        p2_total_actions: how many times TFT acted (env steps)
+        log_prob: SUM of log probabilities of completion tokens (not mean!)
+        value: value estimate
+        entropy: entropy of the policy over completion tokens
     """
+    outputs, value = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+    
+    # Shift for next-token prediction
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    
+    # Compute log probs and entropy
+    log_probs_all = F.log_softmax(shift_logits, dim=-1)
+    probs_all = F.softmax(shift_logits, dim=-1)
+    
+    # Token-level log probs
+    token_log_probs = log_probs_all.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+    
+    # Token-level entropy: -sum(p * log(p))
+    token_entropy = -(probs_all * log_probs_all).sum(dim=-1)
+    
+    # Mask: only completion tokens
+    seq_len = shift_labels.shape[1]
+    completion_mask = torch.zeros(1, seq_len, device=device)
+    if prompt_length - 1 < seq_len:
+        completion_mask[:, prompt_length - 1:] = 1.0
+    
+    mask = attention_mask[:, 1:] * completion_mask
+    
+    # SUM log prob over completion (for proper PPO ratio calculation)
+    masked_log_probs = token_log_probs * mask
+    sum_log_prob = masked_log_probs.sum()
+    
+    # MEAN entropy over completion tokens
+    masked_entropy = token_entropy * mask
+    num_tokens = mask.sum().clamp(min=1)
+    mean_entropy = masked_entropy.sum() / num_tokens
+    
+    return sum_log_prob, value, mean_entropy
 
+
+def compute_gae(rewards, values, gamma, lam):
+    """Compute GAE with proper handling."""
+    n = len(rewards)
+    if n == 0:
+        return [], []
+    
+    advantages = []
+    gae = 0.0
+    values_with_terminal = values + [0.0]
+    
+    for t in reversed(range(n)):
+        delta = rewards[t] + gamma * values_with_terminal[t + 1] - values[t]
+        gae = delta + gamma * lam * gae
+        advantages.insert(0, gae)
+    
+    returns = [adv + val for adv, val in zip(advantages, values)]
+    return advantages, returns
+
+
+def rollout_episode_for_ppo(
+    model, ref_model, tokenizer, config, device, episode_id, moral_type, opponent,
+    temperature=0.7, top_p=0.9, max_new_tokens=32, xi=3.0, illegal_penalty=-6.0
+):
+    """Roll out one episode with both policy and reference log probs."""
     env = StagHuntEnv(config)
     obs = env.reset(random_initial_state=True)
     opponent.reset()
-
-    samples: List[DecisionSample] = []
-    step_rewards_p1: List[float] = []
-    step_rewards_p2: List[float] = []
-
-    p2_stag_count = 0
-    p2_total_actions = 0
+    step_data_list, step_rewards_p1, step_rewards_p2 = [], [], []
+    p2_stag_count, p2_total_actions = 0, 0
+    model.eval()
+    ref_model.eval()
 
     for t in range(config.num_rounds):
         round_idx = t + 1
-
         history = obs["history"]
-
-        # From P1's perspective:
-        opp_prev_action = None
-        prev_a1, prev_a2 = (None, None)
-        if history:
-            prev_a1, prev_a2 = history[-1]
-            opp_prev_action = prev_a2  # P2's last action
-
+        opp_prev_action, prev_a1 = (history[-1][1], history[-1][0]) if history else (None, None)
+        
         prompt = build_decision_prompt(1, obs, config, tokenizer)
-        completion = generate_completion(
-            model, tokenizer, prompt, device,
-            temperature=temperature, top_p=top_p,
-        )
-        action_p1, is_legal = extract_action_from_completion(completion)
+        prompt_encoding = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt_length = prompt_encoding["input_ids"].shape[1]
 
-        sample = DecisionSample(
-            episode_id=episode_id,
-            player_id=1,
-            round_idx=round_idx,
-            prompt=prompt,
-            completion=completion,
-            reward=0.0,
-            action=action_p1,
-            opp_prev_action=opp_prev_action or "",
-            is_legal=is_legal,
+        with torch.no_grad():
+            # Generate with repetition penalty to avoid degenerate outputs
+            output_ids = model.generate(
+                input_ids=prompt_encoding["input_ids"],
+                attention_mask=prompt_encoding["attention_mask"],
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,  # Add repetition penalty
+            )
+        
+        full_input_ids = output_ids
+        completion_text = tokenizer.decode(output_ids[0, prompt_length:], skip_special_tokens=True).strip()
+        attention_mask = torch.ones_like(full_input_ids)
+        
+        with torch.no_grad():
+            log_prob, value, entropy = compute_log_probs_and_entropy(
+                model, full_input_ids, attention_mask, prompt_length, device
+            )
+            ref_log_prob, _, _ = compute_log_probs_and_entropy(
+                ref_model, full_input_ids, attention_mask, prompt_length, device
+            )
+        
+        action_p1, is_legal = extract_action_from_completion(completion_text)
+        
+        step_data = PPOStepData(
+            episode_id=episode_id, round_idx=round_idx, prompt=prompt, completion=completion_text,
+            input_ids=full_input_ids.cpu(), prompt_length=prompt_length, reward=0.0, 
+            value=value.item(), log_prob=log_prob.item(), ref_log_prob=ref_log_prob.item(),
+            action=action_p1, opp_prev_action=opp_prev_action or "", is_legal=is_legal
         )
 
         if not is_legal:
-            # Illegal action → no env step; penalty for P1 only
             moral_r1 = compute_moral_reward_stag_hunt(
-                moral_type=moral_type,
-                agent_action=StagHuntEnv.ACTION_HARE,
-                opp_prev_action=opp_prev_action,
-                r_agent=0.0,
-                r_opp=0.0,
-                is_legal=False,
-                xi=xi,
-                illegal_penalty=illegal_penalty,
+                moral_type, StagHuntEnv.ACTION_HARE, opp_prev_action, 0.0, 0.0, False, xi, illegal_penalty
             )
             step_rewards_p1.append(moral_r1)
-            samples.append(sample)
-            # TFT does not act; no P2 reward for this "round"
+            step_data.reward = moral_r1
+            step_data_list.append(step_data)
             continue
 
-        # legal → TFT acts, env steps
         action_p2 = opponent.act(obs)
-
         p2_total_actions += 1
-        if action_p2 == StagHuntEnv.ACTION_STAG:
+        if action_p2 == StagHuntEnv.ACTION_STAG: 
             p2_stag_count += 1
-
         obs, (r1, r2), done, info = env.step(action_p1, action_p2)
 
-        # P1 moral reward
-        moral_r1 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=action_p1,
-            opp_prev_action=opp_prev_action,
-            r_agent=r1,
-            r_opp=r2,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-
-        # TFT moral reward (treat TFT as agent, P1 as opponent)
-        moral_r2 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=action_p2,
-            opp_prev_action=prev_a1,  # previous P1 move
-            r_agent=r2,
-            r_opp=r1,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-
+        moral_r1 = compute_moral_reward_stag_hunt(moral_type, action_p1, opp_prev_action, r1, r2, True, xi, illegal_penalty)
+        moral_r2 = compute_moral_reward_stag_hunt(moral_type, action_p2, prev_a1, r2, r1, True, xi, illegal_penalty)
         step_rewards_p1.append(moral_r1)
         step_rewards_p2.append(moral_r2)
-        samples.append(sample)
+        step_data.reward = moral_r1
+        step_data_list.append(step_data)
 
-    total_moral_p1 = float(sum(step_rewards_p1))
-
-    for s, r in zip(samples, step_rewards_p1):
-        s.reward = r
-
-    # Note: step_rewards_p2 can be shorter than samples (no entries for illegal P1 moves)
-    return samples, total_moral_p1, step_rewards_p2, p2_stag_count, p2_total_actions
+    return step_data_list, float(sum(step_rewards_p1)), step_rewards_p2, p2_stag_count, p2_total_actions
 
 
-def collect_batch_moral_vs_tft(
-    model,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    num_episodes: int,
-    moral_type: str,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    logger: logging.Logger = None,
-    opponent_type: str = "tft",
-) -> Tuple[List[DecisionSample], float, List[float]]:
-    """
-    Collect num_episodes of (LLM vs fixed opponent).
-
-    Returns:
-        all_samples: DecisionSample list for P1
-        opp_stag_rate: overall STAG rate of the opponent in this batch
-        opp_rewards: list of opponent moral rewards for all env steps in batch
-    """
-    if logger is None:
+def collect_batch_for_ppo(
+    model, ref_model, tokenizer, config, device, num_episodes, moral_type,
+    temperature=0.7, top_p=0.9, logger=None, opponent_type="tft"
+):
+    if logger is None: 
         logger = get_logger()
-
-    all_samples: List[DecisionSample] = []
+    all_step_data, opp_rewards_batch = [], []
     opponent = make_fixed_opponent(opponent_type)
-
-    total_p2_stags = 0
-    total_p2_actions = 0
-    opp_rewards_batch: List[float] = []
+    total_p2_stags, total_p2_actions = 0, 0
 
     for ep_id in range(num_episodes):
-        logger.info(
-            f"  Rolling out moral episode {ep_id} "
-            f"(type={moral_type}) vs fixed opponent '{opponent_type}'..."
+        logger.info(f"  Rolling out episode {ep_id} (type={moral_type}) vs '{opponent_type}'...")
+        step_data_list, total_moral_p1, opp_rewards_ep, p2_stags, p2_actions = rollout_episode_for_ppo(
+            model, ref_model, tokenizer, config, device, ep_id, moral_type, opponent, temperature, top_p
         )
-        samples, total_moral_p1, opp_rewards_ep, p2_stags, p2_actions = rollout_episode_vs_tft(
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            device=device,
-            episode_id=ep_id,
-            moral_type=moral_type,
-            opponent=opponent,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        all_samples.extend(samples)
+        all_step_data.extend(step_data_list)
         opp_rewards_batch.extend(opp_rewards_ep)
-
         total_p2_stags += p2_stags
         total_p2_actions += p2_actions
-
+        
         if ep_id < 2:
             logger.info(f"    Episode {ep_id} total moral return (P1)={total_moral_p1:.3f}")
-            rounds = [
-                (s.round_idx, s.player_id,
-                 extract_action_from_completion(s.completion)[0])
-                for s in samples
-            ]
-            logger.info("    Parsed actions (round, player, action):")
-            for triple in rounds:
-                logger.info(f"      {triple}")
-
-            opp_ep_rate = (p2_stags / p2_actions) if p2_actions > 0 else 0.0
-            opp_ep_mean = (sum(opp_rewards_ep) / len(opp_rewards_ep)) if opp_rewards_ep else 0.0
-            logger.info(f"    Opponent STAG rate (episode {ep_id})={opp_ep_rate:.3f}")
-            logger.info(f"    Opponent mean moral reward (episode {ep_id})={opp_ep_mean:.3f}")
+            # Log illegal rate
+            illegal_count = sum(1 for s in step_data_list if not s.is_legal)
+            logger.info(f"    Illegal actions: {illegal_count}/{len(step_data_list)}")
 
     opp_stag_rate = (total_p2_stags / total_p2_actions) if total_p2_actions > 0 else 0.0
-    return all_samples, opp_stag_rate, opp_rewards_batch
-
-
-# ===== Moral self-play with TWO separate learning agents =====
-
-def rollout_episode_two_llm_agents(
-    model_p1,
-    model_p2,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    episode_id: int,
-    moral_type: str,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    xi: float = 3.0,
-    illegal_penalty: float = -6.0,
-) -> Tuple[List[DecisionSample], float, float]:
-    """
-    Self-play rollout: two distinct LLM policies (model_p1, model_p2)
-    play Player 1 and Player 2 respectively. Both receive moral,
-    per-decision rewards.
-    """
-
-    env = StagHuntEnv(config)
-    obs = env.reset(random_initial_state=True)
-
-    samples: List[DecisionSample] = []
-    rewards_p1: List[float] = []
-    rewards_p2: List[float] = []
-
-    for t in range(config.num_rounds):
-        round_idx = t + 1
-        history = obs["history"]
-
-        prev_a1, prev_a2 = (None, None)
-        if history:
-            prev_a1, prev_a2 = history[-1]
-
-        # ---- Player 1 decision (model_p1) ----
-        prompt1 = build_decision_prompt(1, obs, config, tokenizer)
-        completion1 = generate_completion(
-            model_p1, tokenizer, prompt1, device,
-            temperature=temperature, top_p=top_p,
-        )
-        a1, legal1 = extract_action_from_completion(completion1)
-        sample1 = DecisionSample(
-            episode_id=episode_id,
-            player_id=1,
-            round_idx=round_idx,
-            prompt=prompt1,
-            completion=completion1,
-            reward=0.0,
-            action=a1,
-            opp_prev_action=prev_a2 or "",
-            is_legal=legal1,
-        )
-
-        # ---- Player 2 decision (model_p2) ----
-        prompt2 = build_decision_prompt(2, obs, config, tokenizer)
-        completion2 = generate_completion(
-            model_p2, tokenizer, prompt2, device,
-            temperature=temperature, top_p=top_p,
-        )
-        a2, legal2 = extract_action_from_completion(completion2)
-        sample2 = DecisionSample(
-            episode_id=episode_id,
-            player_id=2,
-            round_idx=round_idx,
-            prompt=prompt2,
-            completion=completion2,
-            reward=0.0,
-            action=a2,
-            opp_prev_action=prev_a1 or "",
-            is_legal=legal2,
-        )
-
-        # If either player is illegal, do not advance env; just give penalties
-        if not legal1 or not legal2:
-            r1 = r2 = 0.0
-
-            moral_r1 = compute_moral_reward_stag_hunt(
-                moral_type=moral_type,
-                agent_action=a1 if legal1 else StagHuntEnv.ACTION_HARE,
-                opp_prev_action=prev_a2,
-                r_agent=r1,
-                r_opp=r2,
-                is_legal=legal1,
-                xi=xi,
-                illegal_penalty=illegal_penalty,
-            )
-            moral_r2 = compute_moral_reward_stag_hunt(
-                moral_type=moral_type,
-                agent_action=a2 if legal2 else StagHuntEnv.ACTION_HARE,
-                opp_prev_action=prev_a1,
-                r_agent=r2,
-                r_opp=r1,
-                is_legal=legal2,
-                xi=xi,
-                illegal_penalty=illegal_penalty,
-            )
-
-            sample1.reward = moral_r1
-            sample2.reward = moral_r2
-
-            rewards_p1.append(moral_r1)
-            rewards_p2.append(moral_r2)
-            samples.extend([sample1, sample2])
-            # State unchanged
-            continue
-
-        # ---- Both legal → env step ----
-        obs, (r1, r2), done, info = env.step(a1, a2)
-
-        moral_r1 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=a1,
-            opp_prev_action=prev_a2,
-            r_agent=r1,
-            r_opp=r2,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-        moral_r2 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=a2,
-            opp_prev_action=prev_a1,
-            r_agent=r2,
-            r_opp=r1,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-
-        sample1.reward = moral_r1
-        sample2.reward = moral_r2
-
-        rewards_p1.append(moral_r1)
-        rewards_p2.append(moral_r2)
-        samples.extend([sample1, sample2])
-
-    total_moral_p1 = float(sum(rewards_p1))
-    total_moral_p2 = float(sum(rewards_p2))
-
-    return samples, total_moral_p1, total_moral_p2
-
-
-def collect_batch_moral_two_llm_agents(
-    model_p1,
-    model_p2,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    num_episodes: int,
-    moral_type: str,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    logger: logging.Logger = None,
-) -> List[DecisionSample]:
-    """
-    Collect num_episodes of self-play (LLM vs LLM, two distinct models),
-    with intrinsic moral rewards attached per decision for both players.
-    """
-    if logger is None:
-        logger = get_logger()
-
-    all_samples: List[DecisionSample] = []
-
-    for ep_id in range(num_episodes):
-        logger.info(f"  Rolling out LLM-vs-LLM moral episode {ep_id} (type={moral_type})...")
-        samples, total_moral_p1, total_moral_p2 = rollout_episode_two_llm_agents(
-            model_p1=model_p1,
-            model_p2=model_p2,
-            tokenizer=tokenizer,
-            config=config,
-            device=device,
-            episode_id=ep_id,
-            moral_type=moral_type,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        all_samples.extend(samples)
-
-        if ep_id < 2:
-            logger.info(
-                f"    Episode {ep_id} total moral returns: "
-                f"P1={total_moral_p1:.3f}, P2={total_moral_p2:.3f}"
-            )
-            rounds = [
-                (s.round_idx, s.player_id,
-                 extract_action_from_completion(s.completion)[0])
-                for s in samples
-            ]
-            logger.info("    Parsed actions (round, player, action):")
-            for triple in rounds:
-                logger.info(f"      {triple}")
-
-    return all_samples
-
-
-# ===== Moral self-play with SHARED policy (one model for both players) =====
-
-def rollout_episode_shared_policy(
-    model,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    episode_id: int,
-    moral_type: str,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    xi: float = 3.0,
-    illegal_penalty: float = -6.0,
-) -> Tuple[List[DecisionSample], float, float]:
-    """
-    Self-play rollout: a single LLM policy controls both Player 1 and Player 2.
-    Both receive moral, per-decision rewards.
-    """
-    env = StagHuntEnv(config)
-    obs = env.reset(random_initial_state=True)
-
-    samples: List[DecisionSample] = []
-    rewards_p1: List[float] = []
-    rewards_p2: List[float] = []
-
-    for t in range(config.num_rounds):
-        round_idx = t + 1
-        history = obs["history"]
-
-        prev_a1, prev_a2 = (None, None)
-        if history:
-            prev_a1, prev_a2 = history[-1]
-
-        # ---- Player 1 decision ----
-        prompt1 = build_decision_prompt(1, obs, config, tokenizer)
-        completion1 = generate_completion(
-            model, tokenizer, prompt1, device,
-            temperature=temperature, top_p=top_p,
-        )
-        a1, legal1 = extract_action_from_completion(completion1)
-        sample1 = DecisionSample(
-            episode_id=episode_id,
-            player_id=1,
-            round_idx=round_idx,
-            prompt=prompt1,
-            completion=completion1,
-            reward=0.0,
-            action=a1,
-            opp_prev_action=prev_a2 or "",
-            is_legal=legal1,
-        )
-
-        # ---- Player 2 decision ----
-        prompt2 = build_decision_prompt(2, obs, config, tokenizer)
-        completion2 = generate_completion(
-            model, tokenizer, prompt2, device,
-            temperature=temperature, top_p=top_p,
-        )
-        a2, legal2 = extract_action_from_completion(completion2)
-        sample2 = DecisionSample(
-            episode_id=episode_id,
-            player_id=2,
-            round_idx=round_idx,
-            prompt=prompt2,
-            completion=completion2,
-            reward=0.0,
-            action=a2,
-            opp_prev_action=prev_a1 or "",
-            is_legal=legal2,
-        )
-
-        # If either player is illegal, do not advance env; just give penalties
-        if not legal1 or not legal2:
-            r1 = r2 = 0.0
-
-            moral_r1 = compute_moral_reward_stag_hunt(
-                moral_type=moral_type,
-                agent_action=a1 if legal1 else StagHuntEnv.ACTION_HARE,
-                opp_prev_action=prev_a2,
-                r_agent=r1,
-                r_opp=r2,
-                is_legal=legal1,
-                xi=xi,
-                illegal_penalty=illegal_penalty,
-            )
-            moral_r2 = compute_moral_reward_stag_hunt(
-                moral_type=moral_type,
-                agent_action=a2 if legal2 else StagHuntEnv.ACTION_HARE,
-                opp_prev_action=prev_a1,
-                r_agent=r2,
-                r_opp=r1,
-                is_legal=legal2,
-                xi=xi,
-                illegal_penalty=illegal_penalty,
-            )
-
-            sample1.reward = moral_r1
-            sample2.reward = moral_r2
-
-            rewards_p1.append(moral_r1)
-            rewards_p2.append(moral_r2)
-            samples.extend([sample1, sample2])
-            continue
-
-        # ---- Both legal → env step ----
-        obs, (r1, r2), done, info = env.step(a1, a2)
-
-        moral_r1 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=a1,
-            opp_prev_action=prev_a2,
-            r_agent=r1,
-            r_opp=r2,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-        moral_r2 = compute_moral_reward_stag_hunt(
-            moral_type=moral_type,
-            agent_action=a2,
-            opp_prev_action=prev_a1,
-            r_agent=r2,
-            r_opp=r1,
-            is_legal=True,
-            xi=xi,
-            illegal_penalty=illegal_penalty,
-        )
-
-        sample1.reward = moral_r1
-        sample2.reward = moral_r2
-
-        rewards_p1.append(moral_r1)
-        rewards_p2.append(moral_r2)
-        samples.extend([sample1, sample2])
-
-    total_moral_p1 = float(sum(rewards_p1))
-    total_moral_p2 = float(sum(rewards_p2))
-
-    return samples, total_moral_p1, total_moral_p2
-
-
-def collect_batch_moral_shared_policy(
-    model,
-    tokenizer,
-    config: StagHuntConfig,
-    device: torch.device,
-    num_episodes: int,
-    moral_type: str,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    logger: logging.Logger = None,
-) -> List[DecisionSample]:
-    """
-    Collect num_episodes of self-play with a single shared policy
-    controlling both players.
-    """
-    if logger is None:
-        logger = get_logger()
-
-    all_samples: List[DecisionSample] = []
-
-    for ep_id in range(num_episodes):
-        logger.info(
-            f"  Rolling out shared-policy moral episode {ep_id} (type={moral_type})..."
-        )
-        samples, total_moral_p1, total_moral_p2 = rollout_episode_shared_policy(
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            device=device,
-            episode_id=ep_id,
-            moral_type=moral_type,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        all_samples.extend(samples)
-
-        if ep_id < 2:
-            logger.info(
-                f"    Episode {ep_id} total moral returns: "
-                f"P1={total_moral_p1:.3f}, P2={total_moral_p2:.3f}"
-            )
-            rounds = [
-                (s.round_idx, s.player_id,
-                 extract_action_from_completion(s.completion)[0])
-                for s in samples
-            ]
-            logger.info("    Parsed actions (round, player, action):")
-            for triple in rounds:
-                logger.info(f"      {triple}")
-
-    return all_samples
-
-
-# ===========================
-# 5. GRPO-style RL training
-# ===========================
-
-def compute_logprob_for_sample(
-    model,
-    tokenizer,
-    sample: DecisionSample,
-    device: torch.device,
-    max_length: int = 512,
-) -> torch.Tensor:
-    """
-    Compute mean log p(completion | prompt) for a single DecisionSample.
-
-    Returns:
-        logprob: scalar tensor (requires_grad=True)
-    """
-    full_text = sample.prompt + sample.completion
-
-    enc = tokenizer(
-        full_text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-    ).to(device)
-
-    input_ids = enc["input_ids"]
-    attention_mask = enc["attention_mask"]
-
-    # Figure out where the completion starts
-    prompt_enc = tokenizer(
-        sample.prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-    ).to(device)
-    prompt_len = prompt_enc["input_ids"].shape[1]
-
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-    )
-    logits = outputs.logits  # [1, seq_len, vocab]
-
-    # Standard next-token shift
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    shift_attn = attention_mask[:, 1:].contiguous()
-
-    # Mask: only completion tokens (everything after prompt)
-    completion_mask = torch.zeros_like(shift_attn)
-    completion_mask[:, prompt_len - 1:] = 1  # from last prompt token onward
-
-    log_probs_all = torch.log_softmax(shift_logits, dim=-1)
-    token_log_probs = log_probs_all.gather(
-        dim=-1,
-        index=shift_labels.unsqueeze(-1)
-    ).squeeze(-1)  # [1, seq_len]
-
-    mask = shift_attn * completion_mask
-    token_log_probs = token_log_probs * mask
-
-    num_tokens = mask.sum().clamp(min=1)
-    logprob = token_log_probs.sum() / num_tokens  # mean logprob over completion
-
-    return logprob  # scalar with grad
-
-
-def train_grpo_stag_hunt_local(args):
-    """
-    Main training loop.
-
-    Use the `setup` flag below to choose between:
-      - "tft":     Player 1 (LLM) vs fixed Tit-for-Tat opponent
-      - "two_llm": Player 1 (LLM) vs Player 2 (LLM), both learning
-    """
-    setup = args.setup
-    opponent_type = args.opponent_type # (used when setup == "tft")
-
-    base_model_name_p1 = args.model_p1
-    base_model_name_p2 = args.model_p2 or args.model_p1  # default: same as P1
-
+    return all_step_data, opp_stag_rate, opp_rewards_batch
+
+
+def ppo_train_step(
+    model, ref_model, optimizer, step_data_list, device, 
+    ppo_epochs, mini_batch_size, cliprange, cliprange_value, 
+    vf_coef, entropy_coef, kl_coef, gamma, lam, max_grad_norm,
+    target_kl, reward_scale, normalize_rewards, normalize_advantages,
+    use_adaptive_kl, logger
+):
+    """PPO training step with improved stability."""
+    
+    if len(step_data_list) == 0:
+        return {"policy_loss": 0, "value_loss": 0, "kl": 0, "entropy": 0, "approx_kl": 0}
+    
+    # Scale rewards
+    for s in step_data_list:
+        s.reward = s.reward * reward_scale
+    
+    # Optionally normalize rewards across batch
+    if normalize_rewards:
+        rewards = np.array([s.reward for s in step_data_list])
+        reward_mean = rewards.mean()
+        reward_std = rewards.std() + 1e-8
+        for s in step_data_list:
+            s.reward = (s.reward - reward_mean) / reward_std
+    
+    # Compute GAE per episode
+    episodes = {}
+    for s in step_data_list:
+        if s.episode_id not in episodes: 
+            episodes[s.episode_id] = []
+        episodes[s.episode_id].append(s)
+
+    all_advantages, all_returns = [], []
+    for ep_id in sorted(episodes.keys()):
+        ep_data = episodes[ep_id]
+        rewards = [s.reward for s in ep_data]
+        values = [s.value for s in ep_data]
+        advantages, returns = compute_gae(rewards, values, gamma, lam)
+        all_advantages.extend(advantages)
+        all_returns.extend(returns)
+
+    # Normalize advantages
+    if normalize_advantages and len(all_advantages) > 1:
+        advantages_tensor = torch.tensor(all_advantages, dtype=torch.float32)
+        adv_mean = advantages_tensor.mean()
+        adv_std = advantages_tensor.std().clamp(min=1e-8)
+        normalized_advantages = ((advantages_tensor - adv_mean) / adv_std).tolist()
+    else:
+        normalized_advantages = all_advantages
+    
+    for i, s in enumerate(step_data_list):
+        s.advantage = normalized_advantages[i]
+        s.return_value = all_returns[i]
+
+    # Training loop with early stopping
+    model.train()
+    total_policy_loss, total_value_loss, total_kl, total_entropy = 0.0, 0.0, 0.0, 0.0
+    total_approx_kl = 0.0
+    num_batches = 0
+    early_stop = False
+
+    for epoch in range(ppo_epochs):
+        if early_stop:
+            break
+            
+        indices = list(range(len(step_data_list)))
+        np.random.shuffle(indices)
+        
+        for batch_start in range(0, len(indices), mini_batch_size):
+            batch_indices = indices[batch_start:batch_start + mini_batch_size]
+            batch_data = [step_data_list[i] for i in batch_indices]
+            
+            batch_policy_loss, batch_value_loss, batch_kl, batch_entropy = 0.0, 0.0, 0.0, 0.0
+            batch_approx_kl = 0.0
+            optimizer.zero_grad()
+
+            for s in batch_data:
+                input_ids = s.input_ids.to(device)
+                attention_mask = torch.ones_like(input_ids)
+                
+                # Current policy
+                curr_log_prob, curr_value, curr_entropy = compute_log_probs_and_entropy(
+                    model, input_ids, attention_mask, s.prompt_length, device
+                )
+                
+                # Compute ratio using OLD log prob (from rollout)
+                old_log_prob = torch.tensor(s.log_prob, device=device)
+                ref_log_prob = torch.tensor(s.ref_log_prob, device=device)
+                advantage = torch.tensor(s.advantage, device=device, dtype=torch.float32)
+                
+                # Policy ratio
+                log_ratio = curr_log_prob - old_log_prob
+                ratio = torch.exp(log_ratio)
+                
+                # Clipped surrogate objective
+                clipped_ratio = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+                policy_loss = -torch.min(advantage * ratio, advantage * clipped_ratio)
+                
+                # Value loss with clipping
+                return_value = torch.tensor(s.return_value, device=device, dtype=torch.float32)
+                old_value = torch.tensor(s.value, device=device, dtype=torch.float32)
+                
+                value_pred_clipped = old_value + torch.clamp(
+                    curr_value - old_value, -cliprange_value, cliprange_value
+                )
+                value_loss1 = (curr_value - return_value) ** 2
+                value_loss2 = (value_pred_clipped - return_value) ** 2
+                value_loss = 0.5 * torch.max(value_loss1, value_loss2)
+                
+                # KL divergence from reference (for penalty)
+                kl_div = ref_log_prob - curr_log_prob  # KL(ref || curr) approximation
+                
+                # Approximate KL for early stopping (KL from old policy)
+                approx_kl = ((ratio - 1) - log_ratio).mean()
+                
+                # Total loss
+                loss = policy_loss + vf_coef * value_loss + kl_coef * kl_div - entropy_coef * curr_entropy
+                loss.backward()
+
+                batch_policy_loss += policy_loss.item()
+                batch_value_loss += value_loss.item()
+                batch_kl += kl_div.item()
+                batch_entropy += curr_entropy.item()
+                batch_approx_kl += approx_kl.item()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            
+            n = len(batch_data)
+            total_policy_loss += batch_policy_loss / n
+            total_value_loss += batch_value_loss / n
+            total_kl += batch_kl / n
+            total_entropy += batch_entropy / n
+            total_approx_kl += batch_approx_kl / n
+            num_batches += 1
+            
+            # Early stopping on KL divergence
+            avg_approx_kl = total_approx_kl / num_batches
+            if target_kl is not None and avg_approx_kl > 1.5 * target_kl:
+                logger.info(f"Early stopping at epoch {epoch} due to KL divergence: {avg_approx_kl:.4f}")
+                early_stop = True
+                break
+
+    n_batches = max(num_batches, 1)
+    return {
+        "policy_loss": total_policy_loss / n_batches,
+        "value_loss": total_value_loss / n_batches,
+        "kl": total_kl / n_batches,
+        "entropy": total_entropy / n_batches,
+        "approx_kl": total_approx_kl / n_batches,
+    }
+
+
+def train_ppo_stag_hunt(args):
+    setup, opponent_type = "fixed_opponent", args.opponent_type
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    output_dir = args.output_dir
-    log_dir = os.path.join(output_dir, "logs")
+    output_dir, log_dir = args.output_dir, os.path.join(args.output_dir, "logs")
     os.makedirs(output_dir, exist_ok=True)
-
+    os.makedirs(log_dir, exist_ok=True)
     logger = get_logger(log_dir)
 
     completion_log_path = os.path.join(log_dir, "completions.jsonl")
-    if os.path.exists(completion_log_path):
+    if os.path.exists(completion_log_path): 
         os.remove(completion_log_path)
 
     stag_cfg = StagHuntConfig(
-        num_players=2,
-        num_rounds=args.num_rounds,
-        R_stag_stag=4.0,
-        R_hare_hare=1.0,
-        R_stag_hare=0.0,
-        R_hare_stag=3.0,
+        num_players=2, num_rounds=args.num_rounds, 
+        R_stag_stag=4.0, R_hare_hare=1.0, R_stag_hare=0.0, R_hare_stag=3.0
     )
+    
+    logger.info(f"Starting PPO Stag Hunt training (LLM vs fixed opponent='{opponent_type}')")
+    logger.info(f"Base model P1: {args.model_p1}, StagHuntConfig: {stag_cfg}")
+    logger.info(f"moral_type={args.moral_type}, num_updates={args.num_updates}, episodes_per_batch={args.episodes_per_batch}")
+    logger.info(f"lr={args.lr}, reward_scale={args.reward_scale}, target_kl={args.target_kl}")
+    logger.info(f"PPO params: ppo_epochs={args.ppo_epochs}, mini_batch_size={args.mini_batch_size}, "
+                f"cliprange={args.cliprange}, kl_coef={args.kl_coef}, vf_coef={args.vf_coef}")
 
-    moral_type = args.moral_type
-
-    num_updates = args.num_updates
-    episodes_per_batch = args.episodes_per_batch
-    lr = args.lr
-    max_grad_norm = args.max_grad_norm
-
-    logger.info(f"Starting GRPO Stag Hunt training, setup={setup}")
-    logger.info(f"Base model P1: {base_model_name_p1}")
-    logger.info(f"Base model P2: {base_model_name_p2}")
-    opponent_type = args.opponent_type  # NEW (used when setup == "tft")
-    logger.info(f"StagHuntConfig: {stag_cfg}")
-    logger.info(
-        f"moral_type={moral_type}, num_updates={num_updates}, "
-        f"episodes_per_batch={episodes_per_batch}, lr={lr}, "
-        f"temperature={args.temperature}, top_p={args.top_p}"
-    )
-
-    # ---- Load tokenizer (shared) ----
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_p1, trust_remote_code=True)
-    if tokenizer.pad_token is None:
+    tokenizer = AutoTokenizer.from_pretrained(args.model_p1, trust_remote_code=True)
+    if tokenizer.pad_token is None: 
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    # === containers for logging stats ===
+    # Load models
+    logger.info("Loading policy model...")
+    base_model = AutoModelForCausalLM.from_pretrained(args.model_p1, trust_remote_code=True)
+    model = CausalLMWithValueHead(base_model).to(device)
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    logger.info("Loading reference model...")
+    ref_base_model = AutoModelForCausalLM.from_pretrained(args.model_p1, trust_remote_code=True)
+    ref_model = CausalLMWithValueHead(ref_base_model).to(device)
+    ref_model.eval()
+    for param in ref_model.parameters(): 
+        param.requires_grad = False
+
+    # Optimizer with lower learning rate
+    optimizer = AdamW(model.parameters(), lr=args.lr, eps=1e-5)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=max(1, int(0.1 * args.num_updates)), 
+        num_training_steps=args.num_updates
+    )
+
+    # Stats
     stats = {
-        "update": [],
-        "mean_reward": [],
-        "std_reward": [],
-        "mean_reward_p1": [],
-        "mean_reward_p2": [],
-        "avg_loss_p1": [],
-        "avg_loss_p2": [],
-        "p1_stag_rate": [],
-        "p2_stag_rate": [],
-        "global_stag_rate": [],
+        "update": [], "mean_reward": [], "std_reward": [], "mean_reward_p1": [], "mean_reward_p2": [],
+        "policy_loss": [], "value_loss": [], "kl": [], "entropy": [], "approx_kl": [],
+        "p1_stag_rate": [], "p2_stag_rate": [], "global_stag_rate": [], "illegal_rate": []
     }
-
-    action_categories = [
-        "STAG|STAG",    # P? STAG, opp previously STAG
-        "STAG|HARE",    # P? STAG, opp previously HARE
-        "HARE|STAG",    # P? HARE, opp previously STAG
-        "HARE|HARE",    # P? HARE, opp previously HARE
-        "illegal|STAG", # illegal completion, opp previously STAG
-        "illegal|HARE", # illegal completion, opp previously HARE
-    ]
+    action_categories = ["STAG|STAG", "STAG|HARE", "HARE|STAG", "HARE|HARE", "illegal|STAG", "illegal|HARE"]
     action_stats = {"episode": []}
-    for cat in action_categories:
+    for cat in action_categories: 
         action_stats[cat] = []
 
-    def stag_rate(decisions: List[DecisionSample]) -> float:
-        if not decisions:
-            return 0.0
-        stags = sum(
-            1 for s in decisions
-            if extract_action_from_completion(s.completion)[0] == StagHuntEnv.ACTION_STAG
+    # Adaptive KL coefficient
+    current_kl_coef = args.kl_coef
+
+    def stag_rate(step_data_list):
+        if not step_data_list: return 0.0
+        return sum(1 for s in step_data_list if s.action == StagHuntEnv.ACTION_STAG and s.is_legal) / len(step_data_list)
+
+    def illegal_rate(step_data_list):
+        if not step_data_list: return 0.0
+        return sum(1 for s in step_data_list if not s.is_legal) / len(step_data_list)
+
+    for update in range(1, args.num_updates + 1):
+        logger.info(f"=== Running update {update}/{args.num_updates} (LLM vs '{opponent_type}') ===")
+        
+        # Collect data
+        step_data_list, opp_stag_rate, opp_rewards = collect_batch_for_ppo(
+            model, ref_model, tokenizer, stag_cfg, device, 
+            args.episodes_per_batch, args.moral_type, 
+            args.temperature, args.top_p, logger, opponent_type
         )
-        return stags / len(decisions)
+        
+        log_completions(step_data_list, completion_log_path, {
+            "setup": setup, "update": update, "moral_type": args.moral_type, "opponent_type": opponent_type
+        })
 
-    # =========================
-    # Case 1: LLM vs fixed opponent
-    # =========================
-    if setup == "tft":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_name_p1,
-            trust_remote_code=True,
-        ).to(device)
-        model.config.pad_token_id = tokenizer.pad_token_id
-        model.train()
-
-        optimizer = AdamW(model.parameters(), lr=lr)
-        total_steps = num_updates
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int(0.1 * total_steps),
-            num_training_steps=total_steps,
+        # PPO update
+        train_stats = ppo_train_step(
+            model, ref_model, optimizer, step_data_list, device,
+            args.ppo_epochs, args.mini_batch_size, args.cliprange, args.cliprange_value,
+            args.vf_coef, args.entropy_coef, current_kl_coef, args.gamma, args.lam,
+            args.max_grad_norm, args.target_kl, args.reward_scale,
+            args.normalize_rewards, args.normalize_advantages, args.use_adaptive_kl, logger
         )
+        scheduler.step()
 
-        for update in range(1, num_updates + 1):
-            logger.info(
-                f"=== Running update {update}/{num_updates} "
-                f"(LLM vs fixed opponent='{opponent_type}') ==="
-            )
+        # Adaptive KL coefficient
+        if args.use_adaptive_kl and args.target_kl is not None:
+            if train_stats["approx_kl"] > args.target_kl * 2:
+                current_kl_coef *= 1.5
+                logger.info(f"Increased KL coef to {current_kl_coef:.4f}")
+            elif train_stats["approx_kl"] < args.target_kl * 0.5:
+                current_kl_coef *= 0.5
+                current_kl_coef = max(current_kl_coef, 0.01)
+                logger.info(f"Decreased KL coef to {current_kl_coef:.4f}")
 
-            # 1) Collect on-policy data
-            samples, opp_stag_rate, opp_rewards = collect_batch_moral_vs_tft(
-                model=model,
-                tokenizer=tokenizer,
-                config=stag_cfg,
-                device=device,
-                num_episodes=episodes_per_batch,
-                moral_type=moral_type,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                logger=logger,
-                opponent_type=opponent_type,
-            )
+        # Stats (using unscaled rewards for logging)
+        raw_rewards_p1 = [s.reward / args.reward_scale for s in step_data_list] if args.reward_scale != 0 else [s.reward for s in step_data_list]
+        rewards_p1 = torch.tensor(raw_rewards_p1, dtype=torch.float32)
+        mean_r_p1 = rewards_p1.mean()
+        
+        rewards_p2 = torch.tensor(opp_rewards, dtype=torch.float32) if opp_rewards else torch.tensor([0.0])
+        mean_r_p2 = rewards_p2.mean()
+        all_rewards = torch.cat([rewards_p1, rewards_p2], dim=0) if opp_rewards else rewards_p1
+        mean_r_global = all_rewards.mean()
+        std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
 
-            log_completions(
-                samples,
-                completion_log_path,
-                meta={
-                    "setup": setup,
-                    "update": update,
-                    "moral_type": moral_type,
-                    "opponent_type": opponent_type,
-                },
-            )
+        # Action stats per episode
+        for ep_local in range(args.episodes_per_batch):
+            global_ep_idx = (update - 1) * args.episodes_per_batch + ep_local + 1
+            counts = {cat: 0 for cat in action_categories}
+            for s in step_data_list:
+                if s.episode_id != ep_local or s.opp_prev_action not in (StagHuntEnv.ACTION_STAG, StagHuntEnv.ACTION_HARE): 
+                    continue
+                key = f"{'illegal' if not s.is_legal else s.action}|{s.opp_prev_action}"
+                if key in counts: 
+                    counts[key] += 1
+            action_stats["episode"].append(global_ep_idx)
+            for cat in action_categories: 
+                action_stats[cat].append(counts[cat])
 
-            # ----- separate P1 / opponent and global stats -----
-            rewards_p1 = torch.tensor([s.reward for s in samples], dtype=torch.float32)
-            mean_r_p1 = rewards_p1.mean()
-            std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
+        p1_stag = stag_rate(step_data_list)
+        p2_stag = opp_stag_rate
+        global_stag = 0.5 * (p1_stag + p2_stag)
+        ill_rate = illegal_rate(step_data_list)
 
-            # std_r_p1 = rewards_p1.std(unbiased=False)
-            # if std_r_p1 < 1e-6:
-            #     logger.warning("Reward variance ~0; skipping update to avoid zero-advantage collapse.")
-            #     continue
+        stats["update"].append(update)
+        stats["mean_reward"].append(mean_r_global.item())
+        stats["std_reward"].append(std_r_global.item())
+        stats["mean_reward_p1"].append(mean_r_p1.item())
+        stats["mean_reward_p2"].append(mean_r_p2.item())
+        stats["policy_loss"].append(train_stats["policy_loss"])
+        stats["value_loss"].append(train_stats["value_loss"])
+        stats["kl"].append(train_stats["kl"])
+        stats["entropy"].append(train_stats["entropy"])
+        stats["approx_kl"].append(train_stats["approx_kl"])
+        stats["p1_stag_rate"].append(p1_stag)
+        stats["p2_stag_rate"].append(p2_stag)
+        stats["global_stag_rate"].append(global_stag)
+        stats["illegal_rate"].append(ill_rate)
 
-            # std_r_p1 = std_r_p1.clamp(min=1e-6)
-
-            # Opponent reward stats for this batch
-            if len(opp_rewards) > 0:
-                rewards_p2 = torch.tensor(opp_rewards, dtype=torch.float32)
-                mean_r_p2 = rewards_p2.mean()
-                all_rewards = torch.cat([rewards_p1, rewards_p2], dim=0)
-            else:
-                rewards_p2 = torch.tensor([0.0], dtype=torch.float32)
-                mean_r_p2 = rewards_p2.mean()
-                all_rewards = rewards_p1
-
-            mean_r_global = all_rewards.mean()
-            std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
-
-            advantages = (rewards_p1 - mean_r_p1) / std_r_p1
-
-            # 2) Policy gradient update (P1 only)
-            model.train()
-            optimizer.zero_grad()
-            total_loss = 0.0
-
-            for s, adv in zip(samples, advantages):
-                adv_i = adv.to(device)
-                logprob_i = compute_logprob_for_sample(
-                    model=model,
-                    tokenizer=tokenizer,
-                    sample=s,
-                    device=device,
-                    max_length=512,
-                )
-                loss_i = -adv_i * logprob_i
-                loss_i.backward()
-                total_loss += loss_i.item()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-
-            # --- action stats per episode (Player 1 only) ---
-            for ep_local in range(episodes_per_batch):
-                global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
-                counts = {cat: 0 for cat in action_categories}
-
-                for s in samples:
-                    if s.episode_id != ep_local:
-                        continue
-                    if s.opp_prev_action not in (
-                        StagHuntEnv.ACTION_STAG,
-                        StagHuntEnv.ACTION_HARE,
-                    ):
-                        continue
-                    opp = s.opp_prev_action
-                    if not s.is_legal:
-                        key = f"illegal|{opp}"
-                    else:
-                        act = s.action or extract_action_from_completion(s.completion)[0]
-                        key = f"{act}|{opp}"
-                    if key in counts:
-                        counts[key] += 1
-
-                action_stats["episode"].append(global_ep_idx)
-                for cat in action_categories:
-                    action_stats[cat].append(counts[cat])
-
-            # === cooperation statistics ===
-            p1_stag = stag_rate(samples)
-            p2_stag = opp_stag_rate  # fixed opponent STAG rate
-            global_stag = 0.5 * (p1_stag + p2_stag)
-
-            avg_loss_p1 = total_loss / max(len(samples), 1)
-            avg_loss_p2 = 0.0
-
-            stats["update"].append(update)
-            stats["mean_reward"].append(mean_r_global.item())
-            stats["std_reward"].append(std_r_global.item())
-            stats["mean_reward_p1"].append(mean_r_p1.item())
-            stats["mean_reward_p2"].append(mean_r_p2.item())
-            stats["avg_loss_p1"].append(avg_loss_p1)
-            stats["avg_loss_p2"].append(avg_loss_p2)
-            stats["p1_stag_rate"].append(p1_stag)
-            stats["p2_stag_rate"].append(p2_stag)
-            stats["global_stag_rate"].append(global_stag)
-
-            logger.info(
-                f"[Update {update}/{num_updates}] "
-                f"Loss P1: {avg_loss_p1:.4f} | "
-                f"Mean moral reward (global): {mean_r_global.item():.3f} "
-                f"(P1={mean_r_p1.item():.3f}, Opp={mean_r_p2.item():.3f}) | "
-                f"Std reward (global): {std_r_global.item():.3f} | "
-                f"P1 STAG rate: {p1_stag:.3f} | "
-                f"Opponent STAG rate: {p2_stag:.3f} | "
-                f"Global STAG rate: {global_stag:.3f} | "
-                f"Num samples (P1): {len(samples)}"
-            )
-
-        # Save model/tokenizer at end of fixed-opponent case
-        model.save_pretrained(os.path.join(output_dir, "agent_fixed_opp_p1"))
-        tokenizer.save_pretrained(output_dir)
-        logger.info(f"Saved fine-tuned Player 1 model (vs fixed opponent) to {output_dir}")
-
-    # =========================
-    # Case 2: Two learning LLM agents
-    # =========================
-    elif setup == "two_llm":
-        model_p1 = AutoModelForCausalLM.from_pretrained(
-            base_model_name_p1,
-            trust_remote_code=True,
-        ).to(device)
-
-        model_p2 = AutoModelForCausalLM.from_pretrained(
-            base_model_name_p2,
-            trust_remote_code=True,
-        ).to(device)
-
-        model_p1.config.pad_token_id = tokenizer.pad_token_id
-        model_p2.config.pad_token_id = tokenizer.pad_token_id
-
-        model_p1.train()
-        model_p2.train()
-
-        optimizer_p1 = AdamW(model_p1.parameters(), lr=lr)
-        optimizer_p2 = AdamW(model_p2.parameters(), lr=lr)
-
-        total_steps = num_updates
-        scheduler_p1 = get_linear_schedule_with_warmup(
-            optimizer_p1,
-            num_warmup_steps=int(0.1 * total_steps),
-            num_training_steps=total_steps,
-        )
-        scheduler_p2 = get_linear_schedule_with_warmup(
-            optimizer_p2,
-            num_warmup_steps=int(0.1 * total_steps),
-            num_training_steps=total_steps,
+        logger.info(
+            f"[Update {update}/{args.num_updates}] "
+            f"Policy Loss: {train_stats['policy_loss']:.4f} | "
+            f"Value Loss: {train_stats['value_loss']:.4f} | "
+            f"Approx KL: {train_stats['approx_kl']:.4f} | "
+            f"Entropy: {train_stats['entropy']:.4f} | "
+            f"Mean reward: {mean_r_global.item():.3f} (P1={mean_r_p1.item():.3f}) | "
+            f"P1 STAG: {p1_stag:.3f} | "
+            f"Illegal rate: {ill_rate:.3f}"
         )
 
-        for update in range(1, num_updates + 1):
-            logger.info(f"=== Running update {update}/{num_updates} (two LLM agents) ===")
+    # Save model
+    model.save_pretrained(os.path.join(output_dir, "agent_fixed_opp_p1"))
+    tokenizer.save_pretrained(output_dir)
+    logger.info(f"Saved fine-tuned model to {output_dir}")
 
-            # 1) Collect data under current policies (on-policy, no grad)
-            samples = collect_batch_moral_two_llm_agents(
-                model_p1=model_p1,
-                model_p2=model_p2,
-                tokenizer=tokenizer,
-                config=stag_cfg,
-                device=device,
-                num_episodes=episodes_per_batch,
-                moral_type=moral_type,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                logger=logger,
-            )
-
-            log_completions(
-                samples,
-                completion_log_path,
-                meta={
-                    "setup": setup,
-                    "update": update,
-                    "moral_type": moral_type,
-                    "opponent_type": None,
-                },
-            )
-
-            # Separate samples by player
-            samples_p1 = [s for s in samples if s.player_id == 1]
-            samples_p2 = [s for s in samples if s.player_id == 2]
-
-            if not samples_p1 or not samples_p2:
-                logger.warning("One of the players has no samples in this batch. Skipping update.")
-                continue
-
-            rewards_p1 = torch.tensor([s.reward for s in samples_p1], dtype=torch.float32)
-            rewards_p2 = torch.tensor([s.reward for s in samples_p2], dtype=torch.float32)
-
-            # Global reward stats for logging
-            all_rewards = torch.cat([rewards_p1, rewards_p2], dim=0)
-            mean_r_global = all_rewards.mean()
-            std_r_global = all_rewards.std(unbiased=False).clamp(min=1e-6)
-
-            # 2) Compute GRPO-style advantages per agent
-            mean_r_p1 = rewards_p1.mean()
-            std_r_p1 = rewards_p1.std(unbiased=False).clamp(min=1e-6)
-            advantages_p1 = (rewards_p1 - mean_r_p1) / std_r_p1
-
-            mean_r_p2 = rewards_p2.mean()
-            std_r_p2 = rewards_p2.std(unbiased=False).clamp(min=1e-6)
-            advantages_p2 = (rewards_p2 - mean_r_p2) / std_r_p2
-
-            # 3) Policy gradient update for Player 1
-            model_p1.train()
-            optimizer_p1.zero_grad()
-            total_loss_p1 = 0.0
-
-            for s, adv in zip(samples_p1, advantages_p1):
-                adv_i = adv.to(device)  # scalar
-                logprob_i = compute_logprob_for_sample(
-                    model=model_p1,
-                    tokenizer=tokenizer,
-                    sample=s,
-                    device=device,
-                    max_length=512,
-                )
-                loss_i = -adv_i * logprob_i
-                loss_i.backward()
-                total_loss_p1 += loss_i.item()
-
-            torch.nn.utils.clip_grad_norm_(model_p1.parameters(), max_grad_norm)
-            optimizer_p1.step()
-            scheduler_p1.step()
-
-            # 4) Policy gradient update for Player 2
-            model_p2.train()
-            optimizer_p2.zero_grad()
-            total_loss_p2 = 0.0
-
-            for s, adv in zip(samples_p2, advantages_p2):
-                adv_i = adv.to(device)  # scalar
-                logprob_i = compute_logprob_for_sample(
-                    model=model_p2,
-                    tokenizer=tokenizer,
-                    sample=s,
-                    device=device,
-                    max_length=512,
-                )
-                loss_i = -adv_i * logprob_i
-                loss_i.backward()
-                total_loss_p2 += loss_i.item()
-
-            torch.nn.utils.clip_grad_norm_(model_p2.parameters(), max_grad_norm)
-            optimizer_p2.step()
-            scheduler_p2.step()
-
-            # --- action stats per episode ---
-            for ep_local in range(episodes_per_batch):
-                global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
-
-                counts = {cat: 0 for cat in action_categories}
-
-                for s in samples:
-                    if s.episode_id != ep_local:
-                        continue
-
-                    # only if we know the opponent's previous move
-                    if s.opp_prev_action not in (
-                        StagHuntEnv.ACTION_STAG,
-                        StagHuntEnv.ACTION_HARE,
-                    ):
-                        continue
-
-                    opp = s.opp_prev_action  # "STAG" or "HARE"
-                    if not s.is_legal:
-                        key = f"illegal|{opp}"
-                    else:
-                        act = s.action or extract_action_from_completion(s.completion)[0]
-                        key = f"{act}|{opp}"
-
-                    if key in counts:
-                        counts[key] += 1
-
-                action_stats["episode"].append(global_ep_idx)
-                for cat in action_categories:
-                    action_stats[cat].append(counts[cat])
-
-            # === cooperation statistics ===
-            p1_stag = stag_rate(samples_p1)
-            p2_stag = stag_rate(samples_p2)
-            global_stag = 0.5 * (p1_stag + p2_stag)
-
-            avg_loss_p1 = total_loss_p1 / max(len(samples_p1), 1)
-            avg_loss_p2 = total_loss_p2 / max(len(samples_p2), 1)
-
-            stats["update"].append(update)
-            stats["mean_reward"].append(mean_r_global.item())
-            stats["std_reward"].append(std_r_global.item())
-            stats["mean_reward_p1"].append(mean_r_p1.item())
-            stats["mean_reward_p2"].append(mean_r_p2.item())
-            stats["avg_loss_p1"].append(avg_loss_p1)
-            stats["avg_loss_p2"].append(avg_loss_p2)
-            stats["p1_stag_rate"].append(p1_stag)
-            stats["p2_stag_rate"].append(p2_stag)
-            stats["global_stag_rate"].append(global_stag)
-
-            logger.info(
-                f"[Update {update}/{num_updates}] "
-                f"Loss P1: {avg_loss_p1:.4f} | Loss P2: {avg_loss_p2:.4f} | "
-                f"Mean moral reward (global): {mean_r_global.item():.3f} "
-                f"(P1={mean_r_p1.item():.3f}, P2={mean_r_p2.item():.3f}) | "
-                f"Std reward (global): {std_r_global.item():.3f} | "
-                f"P1 STAG rate: {p1_stag:.3f} | "
-                f"P2 STAG rate: {p2_stag:.3f} | "
-                f"Global STAG rate: {global_stag:.3f} | "
-                f"Num samples: {len(samples)}"
-            )
-
-        # Save fine-tuned models for two-agent case
-        agent1_dir = os.path.join(output_dir, "agent1")
-        agent2_dir = os.path.join(output_dir, "agent2")
-        os.makedirs(agent1_dir, exist_ok=True)
-        os.makedirs(agent2_dir, exist_ok=True)
-
-        model_p1.save_pretrained(agent1_dir)
-        model_p2.save_pretrained(agent2_dir)
-        tokenizer.save_pretrained(output_dir)
-        logger.info(f"Saved fine-tuned Player 1 model to {agent1_dir}")
-        logger.info(f"Saved fine-tuned Player 2 model to {agent2_dir}")
-        logger.info(f"Saved tokenizer to {output_dir}")
-
-        # =========================
-    # Case 3: Two LLM agents with SHARED policy
-    # =========================
-    elif setup == "shared_llm":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_name_p1,
-            trust_remote_code=True,
-        ).to(device)
-        model.config.pad_token_id = tokenizer.pad_token_id
-        model.train()
-
-        optimizer = AdamW(model.parameters(), lr=lr)
-        total_steps = num_updates
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int(0.1 * total_steps),
-            num_training_steps=total_steps,
-        )
-
-        for update in range(1, num_updates + 1):
-            logger.info(
-                f"=== Running update {update}/{num_updates} "
-                f"(two LLM roles, shared policy) ==="
-            )
-
-            # 1) Collect data under current shared policy
-            samples = collect_batch_moral_shared_policy(
-                model=model,
-                tokenizer=tokenizer,
-                config=stag_cfg,
-                device=device,
-                num_episodes=episodes_per_batch,
-                moral_type=moral_type,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                logger=logger,
-            )
-
-            log_completions(
-                samples,
-                completion_log_path,
-                meta={
-                    "setup": setup,
-                    "update": update,
-                    "moral_type": moral_type,
-                    "opponent_type": None,
-                },
-            )
-
-            samples_p1 = [s for s in samples if s.player_id == 1]
-            samples_p2 = [s for s in samples if s.player_id == 2]
-
-            if not samples_p1 or not samples_p2:
-                logger.warning(
-                    "One of the players has no samples in this batch (shared policy). "
-                    "Skipping update."
-                )
-                continue
-
-            rewards_p1 = torch.tensor([s.reward for s in samples_p1], dtype=torch.float32)
-            rewards_p2 = torch.tensor([s.reward for s in samples_p2], dtype=torch.float32)
-
-            all_samples = samples_p1 + samples_p2
-            rewards_all = torch.tensor(
-                [s.reward for s in all_samples],
-                dtype=torch.float32,
-            )
-
-            mean_r_global = rewards_all.mean()
-            std_r_global = rewards_all.std(unbiased=False).clamp(min=1e-6)
-
-            mean_r_p1 = rewards_p1.mean()
-            mean_r_p2 = rewards_p2.mean()
-
-            advantages_all = (rewards_all - mean_r_global) / std_r_global
-
-            # 2) Policy gradient update (shared policy)
-            model.train()
-            optimizer.zero_grad()
-            total_loss = 0.0
-
-            for s, adv in zip(all_samples, advantages_all):
-                adv_i = adv.to(device)
-                logprob_i = compute_logprob_for_sample(
-                    model=model,
-                    tokenizer=tokenizer,
-                    sample=s,
-                    device=device,
-                    max_length=512,
-                )
-                loss_i = -adv_i * logprob_i
-                loss_i.backward()
-                total_loss += loss_i.item()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-
-            # --- action stats per episode (both players) ---
-            for ep_local in range(episodes_per_batch):
-                global_ep_idx = (update - 1) * episodes_per_batch + ep_local + 1
-
-                counts = {cat: 0 for cat in action_categories}
-                for s in samples:
-                    if s.episode_id != ep_local:
-                        continue
-
-                    if s.opp_prev_action not in (
-                        StagHuntEnv.ACTION_STAG,
-                        StagHuntEnv.ACTION_HARE,
-                    ):
-                        continue
-
-                    opp = s.opp_prev_action
-                    if not s.is_legal:
-                        key = f"illegal|{opp}"
-                    else:
-                        act = s.action or extract_action_from_completion(s.completion)[0]
-                        key = f"{act}|{opp}"
-                    if key in counts:
-                        counts[key] += 1
-
-                action_stats["episode"].append(global_ep_idx)
-                for cat in action_categories:
-                    action_stats[cat].append(counts[cat])
-
-            # === cooperation statistics ===
-            p1_stag = stag_rate(samples_p1)
-            p2_stag = stag_rate(samples_p2)
-            global_stag = 0.5 * (p1_stag + p2_stag)
-
-            avg_loss = total_loss / max(len(all_samples), 1)
-            avg_loss_p1 = avg_loss
-            avg_loss_p2 = avg_loss  # same model
-
-            stats["update"].append(update)
-            stats["mean_reward"].append(mean_r_global.item())
-            stats["std_reward"].append(std_r_global.item())
-            stats["mean_reward_p1"].append(mean_r_p1.item())
-            stats["mean_reward_p2"].append(mean_r_p2.item())
-            stats["avg_loss_p1"].append(avg_loss_p1)
-            stats["avg_loss_p2"].append(avg_loss_p2)
-            stats["p1_stag_rate"].append(p1_stag)
-            stats["p2_stag_rate"].append(p2_stag)
-            stats["global_stag_rate"].append(global_stag)
-
-            logger.info(
-                f"[Update {update}/{num_updates}] "
-                f"Shared policy loss: {avg_loss:.4f} | "
-                f"Mean moral reward (global): {mean_r_global.item():.3f} "
-                f"(P1={mean_r_p1.item():.3f}, P2={mean_r_p2.item():.3f}) | "
-                f"Std reward (global): {std_r_global.item():.3f} | "
-                f"P1 STAG rate: {p1_stag:.3f} | "
-                f"P2 STAG rate: {p2_stag:.3f} | "
-                f"Global STAG rate: {global_stag:.3f} | "
-                f"Num samples (both players): {len(all_samples)}"
-            )
-
-        # Save shared-policy model
-        shared_dir = os.path.join(output_dir, "shared_policy")
-        os.makedirs(shared_dir, exist_ok=True)
-        model.save_pretrained(shared_dir)
-        tokenizer.save_pretrained(output_dir)
-        logger.info(f"Saved fine-tuned shared policy model to {shared_dir}")
-
-    else:
-        raise ValueError(f"Unknown setup: {setup}")
-
-    # === save stats to JSON & CSV ===
-    stats_path_json = os.path.join(log_dir, "training_stats.json")
-    with open(stats_path_json, "w") as f:
+    # Save stats
+    with open(os.path.join(log_dir, "training_stats.json"), "w") as f: 
         json.dump(stats, f, indent=2)
-    logger.info(f"Saved training stats (JSON) to {stats_path_json}")
-
-    stats_path_csv = os.path.join(log_dir, "training_stats.csv")
-    with open(stats_path_csv, "w", newline="") as f:
+    
+    with open(os.path.join(log_dir, "training_stats.csv"), "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                "update",
-                "mean_reward",
-                "std_reward",
-                "mean_reward_p1",
-                "mean_reward_p2",
-                "avg_loss_p1",
-                "avg_loss_p2",
-                "p1_stag_rate",
-                "p2_stag_rate",
-                "global_stag_rate",
-            ]
-        )
+        headers = list(stats.keys())
+        writer.writerow(headers)
         for i in range(len(stats["update"])):
-            writer.writerow([
-                stats["update"][i],
-                stats["mean_reward"][i],
-                stats["std_reward"][i],
-                stats["mean_reward_p1"][i],
-                stats["mean_reward_p2"][i],
-                stats["avg_loss_p1"][i],
-                stats["avg_loss_p2"][i],
-                stats["p1_stag_rate"][i],
-                stats["p2_stag_rate"][i],
-                stats["global_stag_rate"][i],
-            ])
-    logger.info(f"Saved training stats (CSV) to {stats_path_csv}")
+            writer.writerow([stats[h][i] for h in headers])
 
-    # === learning curve plotting ===
-    # 1) Global mean moral reward
-    plt.figure()
-    plt.plot(stats["update"], stats["mean_reward"], marker="o", label="Global mean")
-    plt.plot(stats["update"], stats["mean_reward_p1"], marker="x", linestyle="--", label="P1 mean")
-    plt.plot(stats["update"], stats["mean_reward_p2"], marker="x", linestyle="--", label="P2 mean")
-    plt.xlabel("Update")
-    plt.ylabel("Mean intrinsic (moral) reward")
-    plt.title(f"Learning Curve: Mean Moral Reward vs. Update ({setup})")
-    plt.legend()
-    plt.grid(True)
-    curve_path = os.path.join(log_dir, "learning_curve_reward.png")
-    plt.savefig(curve_path, bbox_inches="tight")
+    # Plots
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Reward
+    axes[0, 0].plot(stats["update"], stats["mean_reward"], marker="o", label="Global mean")
+    axes[0, 0].plot(stats["update"], stats["mean_reward_p1"], marker="x", linestyle="--", label="P1 mean")
+    axes[0, 0].set_xlabel("Update"); axes[0, 0].set_ylabel("Mean reward")
+    axes[0, 0].set_title("Reward Learning Curve"); axes[0, 0].legend(); axes[0, 0].grid(True)
+    
+    # Cooperation
+    axes[0, 1].plot(stats["update"], stats["p1_stag_rate"], marker="o", label="P1 STAG")
+    axes[0, 1].plot(stats["update"], stats["p2_stag_rate"], marker="s", label="Opp STAG")
+    axes[0, 1].plot(stats["update"], stats["illegal_rate"], marker="^", label="Illegal rate", color="red")
+    axes[0, 1].set_xlabel("Update"); axes[0, 1].set_ylabel("Rate")
+    axes[0, 1].set_title("Cooperation & Illegal Rates"); axes[0, 1].legend(); axes[0, 1].grid(True)
+    
+    # Losses
+    axes[0, 2].plot(stats["update"], stats["policy_loss"], marker="o", label="Policy")
+    axes[0, 2].plot(stats["update"], stats["value_loss"], marker="s", label="Value")
+    axes[0, 2].set_xlabel("Update"); axes[0, 2].set_ylabel("Loss")
+    axes[0, 2].set_title("PPO Losses"); axes[0, 2].legend(); axes[0, 2].grid(True)
+    
+    # KL
+    axes[1, 0].plot(stats["update"], stats["approx_kl"], marker="o", label="Approx KL")
+    axes[1, 0].axhline(y=args.target_kl, color='r', linestyle='--', label=f"Target KL={args.target_kl}")
+    axes[1, 0].set_xlabel("Update"); axes[1, 0].set_ylabel("KL Divergence")
+    axes[1, 0].set_title("KL Divergence"); axes[1, 0].legend(); axes[1, 0].grid(True)
+    
+    # Entropy
+    axes[1, 1].plot(stats["update"], stats["entropy"], marker="o", color="orange")
+    axes[1, 1].set_xlabel("Update"); axes[1, 1].set_ylabel("Entropy")
+    axes[1, 1].set_title("Policy Entropy"); axes[1, 1].grid(True)
+    
+    # Action distribution
+    if action_stats["episode"]:
+        counts_array = np.vstack([action_stats[k] for k in action_categories])
+        bottoms = np.zeros(len(action_stats["episode"]))
+        for i, cat in enumerate(action_categories):
+            axes[1, 2].bar(action_stats["episode"], counts_array[i], bottom=bottoms, label=cat, width=1.0)
+            bottoms += counts_array[i]
+        axes[1, 2].set_xlabel("Episode"); axes[1, 2].set_ylabel("Actions")
+        axes[1, 2].set_title("Action Distribution"); axes[1, 2].legend(fontsize=6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "training_summary.png"), bbox_inches="tight", dpi=150)
     plt.close()
-    logger.info(f"Saved learning curve plot to {curve_path}")
 
-    # 2) Cooperation rate
-    plt.figure()
-    plt.plot(stats["update"], stats["p1_stag_rate"], marker="o", label="P1 STAG rate")
-    plt.plot(stats["update"], stats["p2_stag_rate"], marker="s", label="P2 STAG rate")
-    plt.plot(stats["update"], stats["global_stag_rate"], marker="^", label="Global STAG rate")
-    plt.xlabel("Update")
-    plt.ylabel("STAG frequency")
-    plt.title(f"Cooperation (STAG) Rate vs. Update ({setup})")
-    plt.legend()
-    plt.grid(True)
-    coop_curve_path = os.path.join(log_dir, "learning_curve_cooperation.png")
-    plt.savefig(coop_curve_path, bbox_inches="tight")
-    plt.close()
-    logger.info(f"Saved cooperation curve plot to {coop_curve_path}")
+    logger.info("Training complete!")
 
-    # 3) Figure-3-style action distribution plot
-    episodes_for_plot = action_stats["episode"]
-    if len(episodes_for_plot) > 0:
-        cat_keys = action_categories  # preserve order
-        counts_array = np.vstack([action_stats[k] for k in cat_keys])  # [6, num_eps]
-
-        plt.figure(figsize=(12, 4))
-        bottoms = np.zeros(len(episodes_for_plot))
-
-        for i, cat in enumerate(cat_keys):
-            vals = counts_array[i]
-            plt.bar(
-                episodes_for_plot,
-                vals,
-                bottom=bottoms,
-                label=cat,
-                width=1.0,
-            )
-            bottoms += vals
-
-        plt.xlabel("Episode")
-        plt.ylabel("Count of actions per episode")
-        plt.title(
-            f"Actions conditioned on opponent's previous move "
-            f"({moral_type}, {setup})"
-        )
-        plt.legend(loc="upper right", fontsize=7)
-        plt.grid(axis="y", linestyle="--", alpha=0.5)
-
-        fig3_path = os.path.join(log_dir, "figure3_style_actions.png")
-        plt.savefig(fig3_path, bbox_inches="tight")
-        plt.close()
-        logger.info(f"Saved Figure-3-style action distribution plot to {fig3_path}")
-
-
-# ================
-# 6. Entry point
-# ================
 
 if __name__ == "__main__":
     args = parse_args()
-    train_grpo_stag_hunt_local(args)
+    train_ppo_stag_hunt(args)

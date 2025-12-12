@@ -1,8 +1,39 @@
-torch>=2.1
-transformers>=4.43
-trl>=0.24.0
-accelerate>=0.34.0
-peft>=0.10.0
-datasets>=2.19.0
-numpy>=1.24
-matplotlib>=3.8
+# torch>=2.1
+# transformers>=4.43
+# trl>=0.24.0
+# accelerate>=0.34.0
+# peft>=0.10.0
+# datasets>=2.19.0
+# numpy>=1.24
+# matplotlib>=3.8
+
+# Core dependencies for Moral Alignment LLM Training
+# Based on paper's implementation using TRL library
+
+# Core ML
+torch>=2.0.0
+transformers>=4.42.0
+datasets>=2.14.0
+
+# TRL for PPO (paper uses this library)
+trl>=0.9.4
+
+# PEFT for LoRA (paper uses 4-bit quantization with LoRA rank 64)
+peft>=0.11.0
+
+# Quantization support
+bitsandbytes>=0.41.0
+
+# Utilities
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Logging
+wandb  # Optional, for experiment tracking
+
+# For faster tokenization
+sentencepiece>=0.1.99
+accelerate>=0.21.0
