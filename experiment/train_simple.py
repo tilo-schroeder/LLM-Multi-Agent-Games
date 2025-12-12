@@ -239,7 +239,7 @@ def compute_moral_reward(
 
     elif moral_type == "deontological":
         # Example norm: penalize choosing hare when others previously chose stag (scaled by count).
-        # You can swap this for whatever norm you want.
+        # Can be swapped with whatever norm
         if opponent_prev_actions and agent_action == "hare":
             stag_count = sum(1 for a in opponent_prev_actions if a == "stag")
             if stag_count > 0:

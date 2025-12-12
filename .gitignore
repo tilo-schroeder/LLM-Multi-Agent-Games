@@ -1,4 +1,8 @@
 logs
 runs
 .venv
+outputs
+plots
+eval_plots
+eval_outputs
 __pycache__
