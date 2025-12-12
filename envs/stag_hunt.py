@@ -87,7 +87,7 @@ class StagHuntEnv:
         If a player is illegal, do NOT let their action update the public state.
         We freeze their action to the previous state's action for state update/payoff calc.
 
-        (The illegal player still receives illegal penalty in your reward function.)
+        (The illegal player still receives illegal penalty in reward function.)
         """
         cfg = self.config
         assert len(actions) == cfg.num_players

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Evaluate a trained LLM agent on other matrix games (paper-style):
 - Multiple short episodes (random initial state), fixed horizon per episode
@@ -15,7 +14,6 @@ Games implemented:
 Notes:
 - Deontological norm implemented generically as "do not take the selfish action
   if any opponent previously took the prosocial action", scaled by count * xi.
-  (You can edit this per-game easily.)
 - Utilitarian moral reward is sum of all players' payoffs.
 
 Example:
