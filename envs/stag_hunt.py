@@ -19,7 +19,8 @@ class StagHuntConfig:
     action_names: Tuple[str, str] = ("stag", "hare")
 
     # LLM-visible "legal" action tokens (stabilizes parsing & PPO)
-    action_tokens: Tuple[str, str] = ("action1", "action2")
+    # action_tokens: Tuple[str, str] = ("action1", "action2")
+    action_tokens: Tuple[str, str] = ("stag", "hare")
 
     # Threshold Stag Hunt:
     threshold: int = 2
@@ -139,12 +140,56 @@ class CopyFocalLast(Opponent):
         return last[focal_id]
 
 
+class CopyMajorityLast(Opponent):
+    """
+    Multiplayer TFT: copies the MAJORITY action taken by OTHER players last round.
+    Tie-break defaults to 'hare' (safer / risk-dominant), configurable.
+    """
+
+    def __init__(self, tie_break: str = "hare"):
+        assert tie_break in ("stag", "hare", "random", "focal")
+        self.tie_break = tie_break
+
+    def act(self, obs: Dict[str, Any], player_id: int, focal_id: int = 0) -> str:
+        history = obs.get("history", [])
+        if not history:
+            return "hare" if self.tie_break != "stag" else "stag"
+
+        last = history[-1]
+        if not last or player_id >= len(last):
+            return "hare" if self.tie_break != "stag" else "stag"
+
+        # Majority among OTHER players (exclude self)
+        others = [last[j] for j in range(len(last)) if j != player_id]
+        if not others:
+            return "hare" if self.tie_break != "stag" else "stag"
+
+        stag_count = sum(1 for a in others if a == "stag")
+        hare_count = len(others) - stag_count
+
+        if stag_count > hare_count:
+            return "stag"
+        if hare_count > stag_count:
+            return "hare"
+
+        # tie
+        if self.tie_break == "stag":
+            return "stag"
+        if self.tie_break == "hare":
+            return "hare"
+        if self.tie_break == "focal":
+            return last[focal_id] if focal_id < len(last) else "hare"
+        # random
+        return str(np.random.choice(["stag", "hare"]))
+
+
 def make_opponent(opponent_type: str) -> Opponent:
     opponents = {
         "always_stag": AlwaysStag,
         "always_hare": AlwaysHare,
         "random": RandomOpponent,
         "copy_focal": CopyFocalLast,
+        "copy_majority": CopyMajorityLast
     }
     if opponent_type not in opponents:
         raise ValueError(f"Unknown opponent type: {opponent_type}")

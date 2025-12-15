@@ -36,6 +36,7 @@ class PPOConfig:
 
     # Multi-agent training mode
     llm_vs_llm: bool = False
+    shared_policy: bool = False
 
     # Training
     num_episodes: int = 1000
@@ -60,7 +61,7 @@ class PPOConfig:
     xi: float = 3.0
     illegal_penalty: float = -6.0
     reward_scale: float = 1.0
-    normalize_rewards: bool = True
+    normalize_rewards: bool = False
     normalize_advantages: bool = True
     reward_shaping: bool = True
     valid_action_bonus: float = 0.1
@@ -68,7 +69,7 @@ class PPOConfig:
 
     # Generation
     max_new_tokens: int = 8
-    temperature: float = 0.2
+    temperature: float = 0.5
     top_p: float = 0.9
 
     # Output
@@ -222,6 +223,40 @@ def compute_log_probs(
     gen_logits = shift_logits[:, start:min(end, seq_len), :]
     return total_log_prob, value, gen_logits
 
+
+def compute_action_entropy(
+    model: PolicyModelWithValueHead,
+    prompt_ids: torch.Tensor,          # [1, prompt_len]
+    action_token_ids: List[List[int]], # e.g. [[...],[...]]
+) -> torch.Tensor:
+    """
+    Returns scalar entropy over the 2 (or K) actions by scoring each action *sequence*:
+      logp(action) = sum_t log p(token_t | prompt, previous tokens)
+    then p(action) = softmax(logp(action)), entropy = -sum p log p.
+    """
+    device = prompt_ids.device
+    prompt_len = prompt_ids.shape[1]
+
+    logps = []
+    for a_ids in action_token_ids:
+        a = torch.tensor(a_ids, device=device, dtype=prompt_ids.dtype).unsqueeze(0)  # [1, a_len]
+        seq = torch.cat([prompt_ids, a], dim=1)                                      # [1, prompt+a_len]
+        attn = torch.ones_like(seq)
+
+        # Scores ONLY the appended action tokens (gen_len = len(a_ids))
+        lp, _, _ = compute_log_probs(
+            model=model,
+            input_ids=seq,
+            attention_mask=attn,
+            prompt_length=prompt_len,
+            gen_len=len(a_ids),
+        )
+        logps.append(lp)  # each is [1]
+
+    logps = torch.stack(logps, dim=-1).squeeze(0)         # [K]
+    probs = torch.softmax(logps, dim=-1)                  # [K]
+    entropy = -(probs * torch.log(probs + 1e-12)).sum()   # scalar
+    return entropy
 
 @dataclass
 class Experience:

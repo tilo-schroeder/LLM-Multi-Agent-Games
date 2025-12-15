@@ -49,12 +49,14 @@ def main():
         "--opponent_type",
         type=str,
         default="copy_focal",
-        choices=["always_stag", "always_hare", "random", "copy_focal", "llm"],
+        choices=["always_stag", "always_hare", "random", "copy_focal", "copy_majority", "llm"],
         help="In fixed-mode, used for players 1..N-1. If set to 'llm', enables llm_vs_llm.",
     )
 
     # Multi-agent mode
     parser.add_argument("--llm_vs_llm", action="store_true", help="If set, all players are LLM policies trained simultaneously.")
+    parser.add_argument("--shared_policy", action="store_true",
+                        help="If set with --llm_vs_llm, all players share one trainable policy.")
 
     # Training
     parser.add_argument("--num_episodes", type=int, default=1000)
@@ -73,6 +75,10 @@ def main():
     # If opponent_type is "llm", enable llm_vs_llm
     if args.opponent_type == "llm":
         args.llm_vs_llm = True
+
+    if args.shared_policy and not args.llm_vs_llm:
+        print("Warning: --shared_policy requires --llm_vs_llm. Disabling shared_policy.")
+        args.shared_policy = False
 
     # Parse player moral types
     player_morals: List[str] = []
@@ -98,6 +104,7 @@ def main():
 
         opponent_type=args.opponent_type if not args.llm_vs_llm else "llm",
         llm_vs_llm=args.llm_vs_llm,
+        shared_policy=args.shared_policy,
 
         num_episodes=args.num_episodes,
         batch_size=args.batch_size,

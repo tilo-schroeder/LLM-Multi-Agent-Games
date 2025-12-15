@@ -16,7 +16,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from envs.stag_hunt import StagHuntConfig, StagHuntEnv, Opponent, make_opponent
 from .prompting import build_stag_hunt_prompt_with_chat_template, extract_action_from_completion
 from .rewards import compute_moral_reward
-from .ppo import PPOConfig, PolicyModelWithValueHead, Experience, compute_log_probs
+from .ppo import PPOConfig, PolicyModelWithValueHead, Experience, compute_log_probs, compute_action_entropy
 
 
 def _infer_max_new_tokens_for_actions(tokenizer, actions: Tuple[str, str]) -> int:
@@ -82,6 +82,12 @@ class MoralPPOTrainer:
             hare_reward=cfg.hare_reward,
         )
 
+        self.legal_action_token_ids = [
+            self.tokenizer.encode(a, add_special_tokens=False)
+            for a in self.env_config.action_tokens
+        ]
+        assert all(len(x) > 0 for x in self.legal_action_token_ids), "Action tokens must tokenize to >=1 token"
+
         # IMPORTANT: set generation length based on legal action TOKENS
         cfg.max_new_tokens = _infer_max_new_tokens_for_actions(self.tokenizer, self.env_config.action_tokens)
         print(f"Setting max_new_tokens={cfg.max_new_tokens} based on action tokenization for {self.env_config.action_tokens}")
@@ -101,7 +107,7 @@ class MoralPPOTrainer:
         # Which players are LLM-controlled?
         self.llm_player_ids = list(range(cfg.num_players)) if cfg.llm_vs_llm else [0]
 
-        # Build player models + optimizers (one model per LLM player)
+        # Build player models + optimizers
         self.player_models: Dict[int, PolicyModelWithValueHead] = {}
         self.player_optimizers: Dict[int, AdamW] = {}
 
@@ -111,8 +117,9 @@ class MoralPPOTrainer:
             "torch_dtype": torch.float16,
         }
 
-        for pid in self.llm_player_ids:
-            print(f"\nLoading LLM policy for Player {pid}...")
+        if cfg.llm_vs_llm and cfg.shared_policy:
+            # ONE shared model controls all players
+            print(f"\nLoading SHARED LLM policy for all players...")
             base = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
 
             if cfg.use_lora:
@@ -127,13 +134,42 @@ class MoralPPOTrainer:
                     task_type="CAUSAL_LM",
                 )
                 base = get_peft_model(base, lora_config)
-                print(f"Player {pid} model trainables:")
+                print("Shared model trainables:")
                 base.print_trainable_parameters()
 
             hidden_size = base.config.hidden_size
-            model = PolicyModelWithValueHead(base, hidden_size, device=_model_device(base))
-            self.player_models[pid] = model
-            self.player_optimizers[pid] = AdamW(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+            shared_model = PolicyModelWithValueHead(base, hidden_size, device=_model_device(base))
+            shared_optim = AdamW(shared_model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+
+            for pid in self.llm_player_ids:
+                self.player_models[pid] = shared_model
+                self.player_optimizers[pid] = shared_optim
+
+        else:
+            # Original behavior: one model per LLM player
+            for pid in self.llm_player_ids:
+                print(f"\nLoading LLM policy for Player {pid}...")
+                base = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
+
+                if cfg.use_lora:
+                    if cfg.use_4bit:
+                        base = prepare_model_for_kbit_training(base)
+                    lora_config = LoraConfig(
+                        r=cfg.lora_rank,
+                        lora_alpha=cfg.lora_alpha,
+                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                        lora_dropout=0.05,
+                        bias="none",
+                        task_type="CAUSAL_LM",
+                    )
+                    base = get_peft_model(base, lora_config)
+                    print(f"Player {pid} model trainables:")
+                    base.print_trainable_parameters()
+
+                hidden_size = base.config.hidden_size
+                model = PolicyModelWithValueHead(base, hidden_size, device=_model_device(base))
+                self.player_models[pid] = model
+                self.player_optimizers[pid] = AdamW(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
 
         # Fixed opponents for non-LLM players (when not llm_vs_llm)
         self.fixed_opponents: Dict[int, Opponent] = {}
@@ -198,6 +234,7 @@ class MoralPPOTrainer:
         cfg = self.config
         env = StagHuntEnv(self.env_config)
         obs = env.reset(random_initial_state=True)
+        # obs = env.reset(random_initial_state=False)
 
         for opp in self.fixed_opponents.values():
             opp.reset()
@@ -236,7 +273,8 @@ class MoralPPOTrainer:
                             input_ids=encoded["input_ids"],
                             attention_mask=encoded["attention_mask"],
                             max_new_tokens=cfg.max_new_tokens,
-                            do_sample=True,
+                            #do_sample=True,
+                            do_sample=False,
                             temperature=cfg.temperature,
                             top_p=cfg.top_p,
                             pad_token_id=self.tokenizer.pad_token_id,
@@ -460,6 +498,9 @@ class MoralPPOTrainer:
                 gen_probs = F.softmax(gen_logits, dim=-1)
                 gen_log_probs = F.log_softmax(gen_logits, dim=-1)
                 entropy = -(gen_probs * gen_log_probs).sum(dim=-1).mean()
+                # Action-level entropy
+                # prompt_ids = input_ids[:, :exp.prompt_length]
+                # entropy = compute_action_entropy(model, prompt_ids, self.legal_action_token_ids)
 
                 old_log_prob = torch.tensor(exp.log_prob, device=device, dtype=log_prob.dtype)
                 old_value = torch.tensor(exp.value, device=device, dtype=value.dtype)
@@ -517,14 +558,21 @@ class MoralPPOTrainer:
     def train(self):
         cfg = self.config
 
+        # Output path
         tag = f"stag_hunt_n{cfg.num_players}_thr{cfg.threshold}"
-        mode = "llm_vs_llm" if cfg.llm_vs_llm else f"vs_{cfg.opponent_type}"
+        if cfg.llm_vs_llm:
+            mode = "llm_vs_llm_shared" if cfg.shared_policy else "llm_vs_llm"
+        else:
+            mode = f"vs_{cfg.opponent_type}"
         output_path = os.path.join(cfg.output_dir, f"{tag}_{mode}_{cfg.moral_type}")
         os.makedirs(output_path, exist_ok=True)
 
         print(f"\n{'='*70}")
         print(f"Training Stag Hunt | N={cfg.num_players} threshold={cfg.threshold} steps/ep={cfg.batch_size}")
-        print(f"Mode: {'LLM vs LLM (all players)' if cfg.llm_vs_llm else 'LLM vs Fixed (players 1..N-1)'}")
+        if cfg.llm_vs_llm:
+            print(f"Mode: LLM vs LLM ({'shared policy' if cfg.shared_policy else 'separate policies'})")
+        else:
+            print(f"Mode: LLM vs Fixed (players 1..N-1)")
         print(f"LLM players: {self.llm_player_ids}")
         print(f"Player moral types: {cfg.player_moral_types}")
         print(f"Episodes: {cfg.num_episodes}")
@@ -534,16 +582,43 @@ class MoralPPOTrainer:
             player_trajectories = self.collect_batch()
             stats: Dict[str, Any] = {"episode": episode}
 
-            for pid in self.llm_player_ids:
-                trajs = player_trajectories[pid]
-                flat = [e for tr in trajs for e in tr]
-                raw_rewards = [e.reward for e in flat]
+            # -------------------------
+            # SHARED POLICY BRANCH
+            # -------------------------
+            if cfg.llm_vs_llm and cfg.shared_policy:
+                merged_exps: List[Experience] = []
+                merged_raw_rewards: List[float] = []
 
-                exps = self.compute_advantages(trajs)
-                upd = self.ppo_update(exps, self.player_models[pid], self.player_optimizers[pid])
+                # Per-player stats + per-player advantage computation (then merge)
+                for pid in self.llm_player_ids:
+                    trajs = player_trajectories[pid]
+                    flat = [e for tr in trajs for e in tr]
+                    raw_rewards = [e.reward for e in flat]
+                    merged_raw_rewards.extend(raw_rewards)
 
-                if exps and cfg.target_kl:
-                    kls = [((e.log_prob - e.ref_log_prob) / max(e.gen_len, 1)) for e in exps]
+                    exps_pid = self.compute_advantages(trajs)
+                    merged_exps.extend(exps_pid)
+
+                    legal_exps = [e for e in exps_pid if e.is_legal]
+                    coop = sum(1 for e in legal_exps if e.action == "stag") / max(len(legal_exps), 1)
+                    ill = 1.0 - (len(legal_exps) / max(len(exps_pid), 1))
+
+                    stats.update(self._episode_action_conditioned_stats(exps_pid, pid))
+                    stats.update({
+                        f"p{pid}_mean_reward": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
+                        f"p{pid}_std_reward": float(np.std(raw_rewards)) if raw_rewards else 0.0,
+                        f"p{pid}_stag_rate": coop,
+                        f"p{pid}_illegal_rate": ill,
+                    })
+
+                # One PPO update on the shared model/optimizer
+                shared_model = self.player_models[self.llm_player_ids[0]]
+                shared_optim = self.player_optimizers[self.llm_player_ids[0]]
+                upd = self.ppo_update(merged_exps, shared_model, shared_optim)
+
+                # Adaptive ref KL coef update (based on merged experiences)
+                if merged_exps and cfg.target_kl:
+                    kls = [((e.log_prob - e.ref_log_prob) / max(e.gen_len, 1)) for e in merged_exps]
                     avg_kl = float(np.mean(kls))
 
                     if avg_kl > cfg.target_kl * 1.5:
@@ -552,47 +627,105 @@ class MoralPPOTrainer:
                         self.ref_kl_coef /= 1.5
 
                     self.ref_kl_coef = float(np.clip(self.ref_kl_coef, 1e-4, 10.0))
-
                     stats["kl_per_token"] = avg_kl
                     stats["ref_kl_coef"] = self.ref_kl_coef
 
-                legal_exps = [e for e in exps if e.is_legal]
-                coop = sum(1 for e in legal_exps if e.action == "stag") / max(len(legal_exps), 1)
-                ill = 1.0 - (len(legal_exps) / max(len(exps), 1))
-
-                stats.update(self._episode_action_conditioned_stats(exps, pid))
+                # Log shared update stats
                 stats.update({
-                    f"p{pid}_mean_reward": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
-                    f"p{pid}_std_reward": float(np.std(raw_rewards)) if raw_rewards else 0.0,
-                    f"p{pid}_stag_rate": coop,
-                    f"p{pid}_illegal_rate": ill,
-                    f"p{pid}_policy_loss": upd["policy_loss"],
-                    f"p{pid}_value_loss": upd["value_loss"],
-                    f"p{pid}_kl": upd["kl"],
-                    f"p{pid}_entropy": upd["entropy"],
+                    "shared_mean_reward_all_players": float(np.mean(merged_raw_rewards)) if merged_raw_rewards else 0.0,
+                    "shared_policy_loss": upd["policy_loss"],
+                    "shared_value_loss": upd["value_loss"],
+                    "shared_kl": upd["kl"],
+                    "shared_entropy": upd["entropy"],
                 })
+
+                # (Optional) mirror shared update metrics into per-player keys for convenience
+                for pid in self.llm_player_ids:
+                    stats.update({
+                        f"p{pid}_policy_loss": upd["policy_loss"],
+                        f"p{pid}_value_loss": upd["value_loss"],
+                        f"p{pid}_kl": upd["kl"],
+                        f"p{pid}_entropy": upd["entropy"],
+                    })
+
+            # -------------------------
+            # ORIGINAL BRANCHES
+            # -------------------------
+            else:
+                # Update each LLM player independently (separate policies or single-player vs fixed)
+                for pid in self.llm_player_ids:
+                    trajs = player_trajectories[pid]
+                    flat = [e for tr in trajs for e in tr]
+                    raw_rewards = [e.reward for e in flat]
+
+                    exps = self.compute_advantages(trajs)
+                    upd = self.ppo_update(exps, self.player_models[pid], self.player_optimizers[pid])
+
+                    if exps and cfg.target_kl:
+                        kls = [((e.log_prob - e.ref_log_prob) / max(e.gen_len, 1)) for e in exps]
+                        avg_kl = float(np.mean(kls))
+
+                        if avg_kl > cfg.target_kl * 1.5:
+                            self.ref_kl_coef *= 1.5
+                        elif avg_kl < cfg.target_kl / 1.5:
+                            self.ref_kl_coef /= 1.5
+
+                        self.ref_kl_coef = float(np.clip(self.ref_kl_coef, 1e-4, 10.0))
+
+                        stats["kl_per_token"] = avg_kl
+                        stats["ref_kl_coef"] = self.ref_kl_coef
+
+                    legal_exps = [e for e in exps if e.is_legal]
+                    coop = sum(1 for e in legal_exps if e.action == "stag") / max(len(legal_exps), 1)
+                    ill = 1.0 - (len(legal_exps) / max(len(exps), 1))
+
+                    stats.update(self._episode_action_conditioned_stats(exps, pid))
+                    stats.update({
+                        f"p{pid}_mean_reward": float(np.mean(raw_rewards)) if raw_rewards else 0.0,
+                        f"p{pid}_std_reward": float(np.std(raw_rewards)) if raw_rewards else 0.0,
+                        f"p{pid}_stag_rate": coop,
+                        f"p{pid}_illegal_rate": ill,
+                        f"p{pid}_policy_loss": upd["policy_loss"],
+                        f"p{pid}_value_loss": upd["value_loss"],
+                        f"p{pid}_kl": upd["kl"],
+                        f"p{pid}_entropy": upd["entropy"],
+                    })
 
             self.stats_history.append(stats)
 
             if episode % cfg.log_every == 0:
                 parts = [f"Ep {episode:4d}/{cfg.num_episodes}"]
                 for pid in self.llm_player_ids:
-                    parts.append(f"P{pid} R:{stats[f'p{pid}_mean_reward']:+.2f} Stag:{stats[f'p{pid}_stag_rate']:.0%}")
-                parts.append(f"KL(P0):{stats.get('p0_kl', 0.0):.4f}")
+                    parts.append(f"P{pid} R:{stats.get(f'p{pid}_mean_reward', 0.0):+.2f} Stag:{stats.get(f'p{pid}_stag_rate', 0.0):.0%}")
+                # show shared kl if present else p0_kl
+                if "shared_kl" in stats:
+                    parts.append(f"KL(shared):{stats['shared_kl']:.4f}")
+                else:
+                    parts.append(f"KL(P0):{stats.get('p0_kl', 0.0):.4f}")
                 print(" | ".join(parts))
 
             if episode % cfg.save_every == 0:
                 ckpt_dir = os.path.join(output_path, f"checkpoint_{episode}")
                 os.makedirs(ckpt_dir, exist_ok=True)
                 self.tokenizer.save_pretrained(ckpt_dir)
-                for pid in self.llm_player_ids:
-                    self.player_models[pid].save_pretrained(os.path.join(ckpt_dir, f"player_{pid}"))
 
+                if cfg.llm_vs_llm and cfg.shared_policy:
+                    # save once
+                    self.player_models[self.llm_player_ids[0]].save_pretrained(os.path.join(ckpt_dir, "shared_policy"))
+                else:
+                    for pid in self.llm_player_ids:
+                        self.player_models[pid].save_pretrained(os.path.join(ckpt_dir, f"player_{pid}"))
+
+        # Final save
         final_dir = os.path.join(output_path, "final")
         os.makedirs(final_dir, exist_ok=True)
         self.tokenizer.save_pretrained(final_dir)
-        for pid in self.llm_player_ids:
-            self.player_models[pid].save_pretrained(os.path.join(final_dir, f"player_{pid}"))
+
+        if cfg.llm_vs_llm and cfg.shared_policy:
+            self.player_models[self.llm_player_ids[0]].save_pretrained(os.path.join(final_dir, "shared_policy"))
+        else:
+            for pid in self.llm_player_ids:
+                self.player_models[pid].save_pretrained(os.path.join(final_dir, f"player_{pid}"))
 
         stats_path = os.path.join(output_path, "training_stats.json")
         with open(stats_path, "w") as f:
